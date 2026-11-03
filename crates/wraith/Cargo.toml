@@ -1,0 +1,30 @@
+[package]
+name = "wraith"
+description = "Raster in. Wraith out. Blazing-fast white-background PNG → optimised SVG."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "wraith"
+path = "src/main.rs"
+
+[dependencies]
+wraith-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+tempfile = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
