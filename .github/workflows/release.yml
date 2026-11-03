@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changelog:
+    name: git-cliff changelog
+    runs-on: ubuntu-latest
+    outputs:
+      content: ${{ steps.cliff.outputs.content }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: orhun/git-cliff-action@v4
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: changelog
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, pkgs: musl-tools }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install musl tools
+        if: matrix.pkgs
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.pkgs }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/upload-rust-binary-action@v3
+        with:
+          bin: wraith
+          target: ${{ matrix.target }}
+          tar: unix
+          zip: windows
+          checksum: sha256
+          locked: true
+          template: ${{ needs.changelog.outputs.content }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
