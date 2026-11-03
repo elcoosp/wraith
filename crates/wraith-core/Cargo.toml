@@ -1,0 +1,36 @@
+[package]
+name = "wraith-core"
+description = "Blazing-fast PNG → optimised SVG pipeline: trace, normalise, minify."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+image = { workspace = true }
+oxvg_ast = { workspace = true }
+oxvg_optimiser = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+vtracer = { workspace = true }
+visioncortex = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+image = { workspace = true }
+tempfile = { workspace = true }
+
+[lib]
+bench = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
