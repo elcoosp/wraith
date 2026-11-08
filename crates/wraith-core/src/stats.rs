@@ -7,9 +7,12 @@ use std::time::Duration;
 pub enum Stage {
     /// PNG decode.
     Decode,
-    /// Pre-thresholding and conversion to the tracer's image format.
+    /// Pre-thresholding, background removal and conversion to the tracer's
+    /// image format.
     Preprocess,
-    /// Cluster tracing.
+    /// Palette extraction (geometric engine only).
+    Palette,
+    /// Cluster / layer tracing.
     Trace,
     /// Canonical serialization of the traced SVG.
     Serialize,
@@ -24,6 +27,7 @@ impl Stage {
         match self {
             Stage::Decode => "decode",
             Stage::Preprocess => "preprocess",
+            Stage::Palette => "palette",
             Stage::Trace => "trace",
             Stage::Serialize => "serialize",
             Stage::Minify => "minify",
@@ -71,6 +75,11 @@ pub struct ConvertStats {
     pub output_bytes: u64,
     /// Stage timings, in execution order.
     pub timings: Vec<(Stage, Duration)>,
+    /// Palette entries used by the geometric engine (0 for the legacy
+    /// engine, which does not build an explicit palette).
+    pub palette_size: usize,
+    /// Number of output geometry elements (paths and primitive shapes).
+    pub path_count: usize,
 }
 
 impl ConvertStats {
@@ -101,6 +110,7 @@ mod tests {
     fn stage_names_are_stable() {
         assert_eq!(Stage::Decode.as_str(), "decode");
         assert_eq!(Stage::Preprocess.as_str(), "preprocess");
+        assert_eq!(Stage::Palette.as_str(), "palette");
         assert_eq!(Stage::Trace.as_str(), "trace");
         assert_eq!(Stage::Serialize.as_str(), "serialize");
         assert_eq!(Stage::Minify.as_str(), "minify");
@@ -138,6 +148,8 @@ mod tests {
                 (Stage::Decode, Duration::from_millis(2)),
                 (Stage::Trace, Duration::from_millis(3)),
             ],
+            palette_size: 4,
+            path_count: 5,
         };
         assert_eq!(stats.total(), Duration::from_millis(5));
         assert!((stats.reduction() - 0.75).abs() < 1e-9);
@@ -151,6 +163,8 @@ mod tests {
             input_bytes: 100,
             output_bytes: 400,
             timings: vec![],
+            palette_size: 0,
+            path_count: 0,
         };
         assert!((grown.reduction() - 0.0).abs() < 1e-9);
         let empty = ConvertStats {
@@ -159,6 +173,8 @@ mod tests {
             input_bytes: 0,
             output_bytes: 0,
             timings: vec![],
+            palette_size: 0,
+            path_count: 0,
         };
         assert!((empty.reduction() - 0.0).abs() < 1e-9);
     }
