@@ -1,8 +1,13 @@
 //! The pipeline: decode → preprocess → trace → serialize → minify.
+//!
+//! Engine dispatch (roadmap M7): `Mode::BlackWhite` always uses the legacy
+//! vtracer tracer; `Mode::Color` defaults to the geometric engine
+//! ([`crate::color`]) with the legacy path available via [`Engine::Legacy`].
 
+use crate::color;
 use crate::error::Result;
 use crate::preprocess::prepare;
-use crate::settings::Settings;
+use crate::settings::{Engine, Mode, Settings};
 use crate::stats::{ConvertStats, Stopwatch};
 use crate::svgout::serialize;
 use crate::trace::trace;
@@ -25,25 +30,38 @@ pub struct Output {
 pub fn convert(png: &[u8], settings: &Settings) -> Result<Output> {
     let mut sw = Stopwatch::default();
     let prepared = prepare(png, settings, &mut sw)?;
-    let traced = trace(prepared.image, settings, &mut sw)?;
-    let canonical = serialize(
-        &traced,
-        settings.strip_white,
-        Some(u32::from(settings.precision)),
-        &mut sw,
-    );
+    let use_legacy = settings.mode == Mode::BlackWhite || settings.engine == Engine::Legacy;
+    let (dims, canonical, palette_size, path_count) = if use_legacy {
+        let traced = trace(prepared.image, settings, &mut sw)?;
+        let dims = (traced.width, traced.height);
+        let canonical = serialize(&traced, Some(u32::from(settings.precision)), &mut sw);
+        let paths = canonical.matches("<path").count();
+        (dims, canonical, 0, paths)
+    } else {
+        let traced = color::trace_color(
+            &prepared.image,
+            &settings.color,
+            settings.background,
+            &mut sw,
+        );
+        let dims = (traced.width, traced.height);
+        let canonical = color::write::write_svg(&traced);
+        let paths: usize = traced.layers.iter().map(|l| l.shapes.len()).sum();
+        (dims, canonical, traced.palette_size, paths)
+    };
     let svg = match settings.minify {
-        crate::settings::Minify::Off => canonical,
+        crate::settings::Minify::Off => canonical.clone(),
         _ => crate::minify::minify(&canonical, settings.minify, &mut sw)?,
     };
 
-    let (width, height) = (traced.width, traced.height);
     let stats = ConvertStats {
-        width: u32::try_from(width).unwrap_or(u32::MAX),
-        height: u32::try_from(height).unwrap_or(u32::MAX),
+        width: u32::try_from(dims.0).unwrap_or(u32::MAX),
+        height: u32::try_from(dims.1).unwrap_or(u32::MAX),
         input_bytes: png.len() as u64,
         output_bytes: svg.len() as u64,
         timings: sw.laps().to_vec(),
+        palette_size,
+        path_count,
     };
     Ok(Output { svg, stats })
 }
@@ -51,7 +69,7 @@ pub fn convert(png: &[u8], settings: &Settings) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use crate::preprocess::fixture_png;
-    use crate::settings::{Minify, Mode, Quality, Settings};
+    use crate::settings::{Engine, Gradients, Minify, Mode, Quality, Settings};
 
     use super::*;
 
@@ -65,9 +83,11 @@ mod tests {
         assert_eq!(out.stats.height, 64);
         assert_eq!(out.stats.input_bytes, png.len() as u64);
         assert_eq!(out.stats.output_bytes, out.svg.len() as u64);
-        // Five timed stages: decode, preprocess, trace, serialize, minify.
+        // Timed stages: decode, preprocess, trace, serialize, minify.
         assert_eq!(out.stats.timings.len(), 5);
         assert!(out.stats.total().as_nanos() > 0);
+        assert_eq!(out.stats.palette_size, 0); // legacy engine
+        assert!(out.stats.path_count > 0);
     }
 
     #[test]
@@ -107,15 +127,58 @@ mod tests {
     }
 
     #[test]
-    fn color_mode_with_strip_white_removes_background() {
+    fn color_mode_geometric_engine_is_the_default() {
         let png = fixture_png(64);
         let cfg = Settings {
             mode: Mode::Color,
-            strip_white: true,
             ..Settings::new()
         };
         let out = convert(&png, &cfg).expect("converts");
-        assert!(!out.svg.contains("fill=\"#FFFFFF\""));
+        assert!(out.svg.contains("<svg"));
+        assert!(out.stats.palette_size > 0);
+        assert!(out.stats.path_count > 0);
+        // Stage list includes Palette.
+        assert!(
+            out.stats
+                .timings
+                .iter()
+                .any(|(s, _)| *s == crate::stats::Stage::Palette)
+        );
+    }
+
+    #[test]
+    fn color_mode_legacy_engine_still_available() {
+        let png = fixture_png(64);
+        let cfg = Settings {
+            mode: Mode::Color,
+            engine: Engine::Legacy,
+            ..Settings::new()
+        };
+        let out = convert(&png, &cfg).expect("converts");
+        assert!(out.svg.contains("<svg"));
+        assert_eq!(out.stats.palette_size, 0);
+        assert!(
+            !out.stats
+                .timings
+                .iter()
+                .any(|(s, _)| *s == crate::stats::Stage::Palette)
+        );
+    }
+
+    #[test]
+    fn geometric_color_mode_renders_shapes_with_gradients_capable_defaults() {
+        let png = fixture_png(64);
+        let cfg = Settings {
+            mode: Mode::Color,
+            color: crate::settings::ColorSettings {
+                gradients: Gradients::LinearRadial,
+                ..crate::settings::ColorSettings::default()
+            },
+            ..Settings::new()
+        };
+        let out = convert(&png, &cfg).expect("converts");
+        assert!(out.svg.contains("<path") || out.svg.contains("<rect"));
+        assert!(out.svg.contains("</svg>"));
     }
 
     #[test]
@@ -126,8 +189,6 @@ mod tests {
             ..Settings::new()
         };
         let out = convert(&png, &cfg).expect("converts");
-        // Geometry survives; fill may be rewritten by the minifier (#000000 →
-        // #000), so only assert on the shape of the document.
         assert!(out.svg.contains("<path"));
         assert_eq!(out.stats.timings.len(), 5);
     }
