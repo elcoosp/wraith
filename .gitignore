@@ -1,1 +1,4 @@
 /target
+
+# local shipping helper (deliverable lives next to the zip, never committed)
+ship.sh
