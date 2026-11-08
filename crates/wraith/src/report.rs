@@ -140,6 +140,8 @@ mod tests {
                 (wraith_core::Stage::Decode, Duration::from_micros(10)),
                 (wraith_core::Stage::Minify, Duration::from_micros(20)),
             ],
+            palette_size: 4,
+            path_count: 2,
         }
     }
 
