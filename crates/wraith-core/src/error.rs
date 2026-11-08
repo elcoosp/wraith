@@ -35,6 +35,10 @@ pub enum WraithError {
     /// Output location is invalid for the given set of inputs.
     #[error("{0}")]
     BadOutput(String),
+
+    /// SVG render-back (quality metrics) failed.
+    #[error("SVG render failed: {0}")]
+    Render(String),
 }
 
 /// Convenience alias for results in this crate.
@@ -82,6 +86,10 @@ mod tests {
         assert_eq!(
             WraithError::BadOutput(String::from("dir needed")).to_string(),
             "dir needed"
+        );
+        assert_eq!(
+            WraithError::Render(String::from("boom")).to_string(),
+            "SVG render failed: boom"
         );
     }
 }
