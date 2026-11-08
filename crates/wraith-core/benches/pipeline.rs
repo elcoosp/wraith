@@ -149,12 +149,7 @@ fn bench_serialize_vs_vtracer_display(c: &mut Criterion) {
     group.bench_function("wraith_serialize", |b| {
         b.iter(|| {
             let mut sw = Stopwatch::default();
-            black_box(svgout::serialize(
-                black_box(&traced),
-                false,
-                Some(2),
-                &mut sw,
-            ))
+            black_box(svgout::serialize(black_box(&traced), Some(2), &mut sw))
         });
     });
     group.finish();
@@ -220,14 +215,28 @@ fn bench_full_pipeline(c: &mut Criterion) {
             )
         });
     });
-    group.bench_function("color-512-balanced+strip", |b| {
+    group.bench_function("color-512-geometric", |b| {
         b.iter(|| {
             black_box(
                 convert(
                     black_box(&IMG_512),
                     &Settings {
                         mode: Mode::Color,
-                        strip_white: true,
+                        ..Settings::new()
+                    },
+                )
+                .expect("converts"),
+            )
+        });
+    });
+    group.bench_function("color-512-legacy", |b| {
+        b.iter(|| {
+            black_box(
+                convert(
+                    black_box(&IMG_512),
+                    &Settings {
+                        mode: Mode::Color,
+                        engine: wraith_core::settings::Engine::Legacy,
                         ..Settings::new()
                     },
                 )
@@ -274,7 +283,6 @@ fn bench_precision(c: &mut Criterion) {
     group.finish();
 }
 
-#[allow(clippy::too_many_lines)]
 fn benches() -> Criterion {
     Criterion::default()
         .sample_size(20)
