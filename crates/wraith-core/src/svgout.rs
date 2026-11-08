@@ -4,9 +4,14 @@
 //! * hoists a shared fill colour onto a single `<g>` (huge byte win for BW
 //!   output, where every path is black),
 //! * omits `transform` when the offset is the origin,
-//! * skips empty paths and (optionally) pure-white background paths,
+//! * skips empty paths,
 //! * writes straight into a pre-sized `String` — one allocation, no
 //!   intermediate buffers, no XML declaration boilerplate.
+//!
+//! 0.1.x's `strip_white` parameter is gone (roadmap M0 §2.2.2): dropping
+//! paths by *fill-colour equality* deleted legitimate white shapes and kept
+//! near-white AA clusters. Background removal is now a raster operation —
+//! see [`crate::settings::Background`].
 
 use std::fmt::Write as _;
 
@@ -14,35 +19,21 @@ use visioncortex::{Color, PointF64};
 
 use crate::stats::{Stage, Stopwatch};
 
-/// Pure white in the tracer's colour space.
-const WHITE: Color = Color {
-    r: 255,
-    g: 255,
-    b: 255,
-    a: 255,
-};
-
 /// Serializes a traced [`vtracer::SvgFile`] into a minimal, canonical SVG.
 #[must_use]
-pub fn serialize(
-    svg: &vtracer::SvgFile,
-    strip_white: bool,
-    precision: Option<u32>,
-    sw: &mut Stopwatch,
-) -> String {
+pub fn serialize(svg: &vtracer::SvgFile, precision: Option<u32>, sw: &mut Stopwatch) -> String {
     sw.start();
-    let out = write_svg(svg, strip_white, precision);
+    let out = write_svg(svg, precision);
     sw.lap(Stage::Serialize);
     out
 }
 
-fn write_svg(svg: &vtracer::SvgFile, strip_white: bool, precision: Option<u32>) -> String {
+fn write_svg(svg: &vtracer::SvgFile, precision: Option<u32>) -> String {
     // Render path data first so fill-hoisting only happens when there is
-    // actually geometry to wrap (empty and stripped paths vanish here).
+    // actually geometry to wrap (empty paths vanish here).
     let paths: Vec<Rendered> = svg
         .paths
         .iter()
-        .filter(|p| !(strip_white && p.color == WHITE))
         .filter_map(|p| {
             let (d, offset) = p.path.to_svg_string(true, PointF64::default(), precision);
             let d = d.trim_end();
@@ -111,6 +102,14 @@ fn write_path(out: &mut String, path: &Rendered, with_fill: bool) {
 mod tests {
     use visioncortex::{Color, ColorName, CompoundPath, PathI32, Point2};
 
+    /// Pure white in the tracer's colour space (test-local).
+    const WHITE: Color = Color {
+        r: 255,
+        g: 255,
+        b: 255,
+        a: 255,
+    };
+
     use super::*;
     use crate::preprocess::{fixture_png, prepare};
     use crate::settings::Settings;
@@ -142,7 +141,7 @@ mod tests {
         svg.add_path(compound(&[(0, 0), (4, 0), (4, 4)]), black());
         svg.add_path(compound(&[(8, 8), (12, 8), (12, 12)]), black());
         let mut sw = Stopwatch::default();
-        let out = serialize(&svg, false, Some(2), &mut sw);
+        let out = serialize(&svg, Some(2), &mut sw);
         assert!(out.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
         assert!(out.contains("<g fill=\"#000000\">"));
         assert!(out.ends_with("</g></svg>"));
@@ -154,7 +153,7 @@ mod tests {
     fn traced_fixture_serializes_to_geometry() {
         let traced = traced(32);
         let mut sw = Stopwatch::default();
-        let out = serialize(&traced, false, Some(2), &mut sw);
+        let out = serialize(&traced, Some(2), &mut sw);
         assert!(out.contains("<svg"));
         assert!(out.contains("<path"));
         assert!(out.ends_with("</svg>"));
@@ -169,31 +168,23 @@ mod tests {
             compound(&[(5, 5), (9, 5), (9, 9)]),
             Color::color(&ColorName::Red),
         );
-        let out = serialize(&svg, false, Some(2), &mut Stopwatch::default());
+        let out = serialize(&svg, Some(2), &mut Stopwatch::default());
         assert!(!out.contains("<g "));
         assert!(out.contains("fill=\"#000000\""));
         assert!(out.contains("fill=\"#FF0000\""));
     }
 
     #[test]
-    fn white_paths_are_stripped_only_when_asked() {
+    fn white_paths_are_first_class_geometry() {
+        // M0 §2.2.2: white paths are no longer dropped by fill-colour
+        // equality — a white ring or eye-white survives; background removal
+        // is handled by `Background` on the raster.
         let mut svg = vtracer::SvgFile::new(10, 10, Some(2));
         svg.add_path(compound(&[(0, 0), (4, 0), (4, 4)]), WHITE);
         svg.add_path(compound(&[(5, 5), (9, 5), (9, 9)]), black());
-        let kept = serialize(&svg, false, Some(2), &mut Stopwatch::default());
-        assert!(kept.contains("fill=\"#FFFFFF\""));
-        let stripped = serialize(&svg, true, Some(2), &mut Stopwatch::default());
-        assert!(!stripped.contains("fill=\"#FFFFFF\""));
-        assert!(stripped.contains("fill=\"#000000\""));
-    }
-
-    #[test]
-    fn all_white_paths_leave_no_group_and_no_paths() {
-        let mut svg = vtracer::SvgFile::new(10, 10, Some(2));
-        svg.add_path(compound(&[(0, 0), (4, 0), (4, 4)]), WHITE);
-        let out = serialize(&svg, true, Some(2), &mut Stopwatch::default());
-        assert!(!out.contains("<path"));
-        assert!(!out.contains("<g "));
+        let out = serialize(&svg, Some(2), &mut Stopwatch::default());
+        assert!(out.contains("fill=\"#FFFFFF\""));
+        assert!(out.contains("fill=\"#000000\""));
     }
 
     #[test]
@@ -201,7 +192,7 @@ mod tests {
         let mut svg = vtracer::SvgFile::new(4, 4, Some(2));
         svg.add_path(CompoundPath::default(), black());
         svg.add_path(CompoundPath::default(), black());
-        let out = serialize(&svg, false, Some(2), &mut Stopwatch::default());
+        let out = serialize(&svg, Some(2), &mut Stopwatch::default());
         assert!(!out.contains("<path"));
         // Exactly two paths sharing a fill would hoist a group; zero emitted
         // paths must not leave a dangling one.
@@ -212,7 +203,7 @@ mod tests {
     fn zero_offset_omits_transform() {
         let mut svg = vtracer::SvgFile::new(10, 10, Some(2));
         svg.add_path(compound(&[(0, 0), (4, 0), (4, 4)]), black());
-        let out = serialize(&svg, false, Some(2), &mut Stopwatch::default());
+        let out = serialize(&svg, Some(2), &mut Stopwatch::default());
         assert!(!out.contains("transform="));
         assert!(out.contains("d=\"M0,0"));
     }
@@ -221,15 +212,15 @@ mod tests {
     fn nonzero_offset_becomes_translate() {
         let mut svg = vtracer::SvgFile::new(10, 10, Some(2));
         svg.add_path(compound(&[(2, 3), (6, 3), (6, 7)]), black());
-        let out = serialize(&svg, false, Some(2), &mut Stopwatch::default());
+        let out = serialize(&svg, Some(2), &mut Stopwatch::default());
         assert!(out.contains("transform=\"translate(2,3)\""));
     }
 
     #[test]
     fn higher_precision_produces_longer_path_data() {
         let traced = traced(64);
-        let coarse = serialize(&traced, false, Some(1), &mut Stopwatch::default());
-        let fine = serialize(&traced, false, Some(6), &mut Stopwatch::default());
+        let coarse = serialize(&traced, Some(1), &mut Stopwatch::default());
+        let fine = serialize(&traced, Some(6), &mut Stopwatch::default());
         assert!(fine.len() > coarse.len());
     }
 }
