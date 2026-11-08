@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/wraith-core", "crates/wraith"]
+members = ["crates/wraith-core", "crates/wraith", "crates/wraith-eval"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 authors = ["wraith contributors"]
@@ -14,7 +14,7 @@ keywords = ["svg", "png", "vectorize", "trace", "minify"]
 categories = ["command-line-utilities", "graphics", "multimedia::images"]
 
 [workspace.dependencies]
-wraith-core = { version = "0.1.0", path = "crates/wraith-core" }
+wraith-core = { version = "0.2.0", path = "crates/wraith-core", default-features = false }
 anyhow = "1.0.100"
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 clap_complete = "4.6.7"
@@ -26,9 +26,64 @@ thiserror = "2.0.18"
 vtracer = "0.6.5"
 visioncortex = "0.8.8"
 
+# geometric colour engine + eval harness
+resvg = "0.45"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+kurbo = "0.11"
+
 # dev / bench
 criterion = "0.8.2"
 tempfile = "3.24.0"
+
+[workspace.lints.clippy]
+# Pedantic is the baseline everywhere: CI runs clippy with `-D warnings` and
+# the workspace mirrors that gate locally, so every exception below must
+# carry a rationale and be reviewed like an inline `allow` would be.
+pedantic = { level = "warn", priority = -1 }
+# Pixel maths crosses the u8/u32/usize/f32/f64 boundary constantly (colour
+# channels, lattice coordinates, byte counts). Every cast site is bounded by
+# construction: channels are 0..=255, coordinates fit their target by
+# definition, and counts are non-negative. Moving each site to checked maths
+# would bury the algorithms in assertions without adding safety.
+cast_possible_truncation = "allow"
+# Same trade-off: buffer lengths and pixel coordinates are converted to
+# floating point for the geometry stages; no precision loss can occur for
+# any image that fits in memory (f32 mantissa covers 2^24 pixels).
+cast_precision_loss = "allow"
+# Coordinates and channel sums are signed during geometry maths and land in
+# unsigned targets only after clamping/rounding; the sign is proven at the
+# call site (e.g. `hund()` rounds before casting).
+cast_sign_loss = "allow"
+# Negative deltas are stored in i64 and re-cast to narrower integer types
+# only after rounding to hundredths of a pixel (|value| < 2^31 for any
+# realistic canvas); the wrap is unreachable.
+cast_possible_wrap = "allow"
+# The public API mirrors module names on purpose (`minify::minify`,
+# `color::gradients::Gradients`, ...): the repetition reads naturally at the
+# call site and matches the crate's existing naming convention.
+module_name_repetitions = "allow"
+# CLI structs and geometry options carry independent boolean switches; there
+# is no meaningful state machine to factor them into, and the help output is
+# clearer for keeping them flat.
+struct_excessive_bools = "allow"
+# Bench fixture builders and the marching-squares case table are data-heavy
+# by nature; splitting them into sub-fns would obscure the shape of the data.
+too_many_lines = "allow"
+# Geometry code reads best with parallel coordinate names (x0/x1, y0/y1,
+# min/max bounds); renaming to satisfy the lint would hurt readability.
+similar_names = "allow"
+# The geometry kernels use the notation of their source material on purpose:
+# marching-squares edge ids (t/b/l/r), line/segment intersections (a,b,c,d,
+# r,s,t), curve control points (p0..p3, q0..q3) and image axes (x, y, w, h).
+# The maths is checked against textbook formulas, so keeping the names
+# aligned with them prevents transcription bugs.
+many_single_char_names = "allow"
+# Field/layer builders take one argument per documented engine knob
+# (coverage field, trap radius, tolerance, corner angle, …) so every stage
+# stays explicit and testable; an options struct would just move the same
+# list one call away.
+too_many_arguments = "allow"
 
 [profile.release]
 opt-level = 3
