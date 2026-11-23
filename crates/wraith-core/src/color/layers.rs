@@ -218,13 +218,45 @@ pub(crate) fn build_layers(
             if acc.cov.is_empty() || (rank == 0 && skip_rank0) {
                 return None;
             }
-            let field = build_rank_field(acc, w, trap_r);
+            let unit_idx = unit_of_rank[rank];
+            let unit_px = f64::from(units[unit_idx].px);
+            if unit_px < min_area * 2.5 {
+                let reg = units[unit_idx].region as usize;
+                if regions.kinds[reg] == RegionKind::Flat {
+                    let c_self = pal[regions.flat_rank[reg]];
+                    let (bx0, by0, bx1, by1) = acc.bbox;
+                    let mut max_oklab_d2 = 0.0_f32;
+                    let mut has_opaque_nb = false;
+                    let y0 = by0.saturating_sub(1);
+                    let y1 = (by1 + 1).min(h);
+                    let x0 = bx0.saturating_sub(1);
+                    let x1 = (bx1 + 1).min(w);
+                    for yy in y0..y1 {
+                        for xx in x0..x1 {
+                            let nreg = lab[yy * w + xx] as usize;
+                            if nreg < regions.kinds.len() && nreg != reg && regions.kinds[nreg] == RegionKind::Flat {
+                                has_opaque_nb = true;
+                                let c_nb = pal[regions.flat_rank[nreg]];
+                                let d0 = c_self[0] - c_nb[0];
+                                let d1 = c_self[1] - c_nb[1];
+                                let d2 = c_self[2] - c_nb[2];
+                                max_oklab_d2 = max_oklab_d2.max(d0 * d0 + d1 * d1 + d2 * d2);
+                            }
+                        }
+                    }
+                    if has_opaque_nb && max_oklab_d2 < 0.02 {
+                        return None;
+                    }
+                }
+            }
+            let unit_trap = if unit_px >= min_area { trap_r } else { 0 };
+            let field = build_rank_field(acc, w, unit_trap);
             let shapes = trace_rank_field(
                 &field,
                 acc,
                 w,
                 h,
-                trap_r,
+                unit_trap,
                 tol,
                 corner_rad,
                 min_area,
