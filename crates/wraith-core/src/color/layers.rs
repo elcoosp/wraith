@@ -208,7 +208,7 @@ pub(crate) fn build_layers(
     let tol = f64::from(settings.tolerance_px);
     let corner_rad = settings.corner_angle_rad();
     let min_area = f64::from(settings.min_area_px2);
-    let smooth = 2_usize; // binomial smoothing rounds (prototype default)
+    let smooth = usize::from(settings.smooth_iters);
     let skip_rank0 = background_rect && rank0_is_flat;
 
     let results: Vec<Option<ColorLayer>> = (0..unit_count)
@@ -953,7 +953,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let i = (y * w + x) * 4;
-                let d = ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
+                let d = (x as f64 - cx).hypot(y as f64 - cy);
                 if (12.0..40.0).contains(&d) {
                     px[i] = 30;
                     px[i + 1] = 90;
@@ -988,14 +988,14 @@ mod tests {
             .iter()
             .find(|l| l.paint == Paint::Solid([255, 255, 255]))
             .expect("white interior layer");
-        assert!(!white.shapes.is_empty());
+        assert_ne!(white.shapes.len(), 0);
         // The blue layer carries the body ring; its compound path must contain
         // the hole subpath (two rings), not fill the hole area.
         let blue = layers
             .iter()
             .find(|l| l.paint == Paint::Solid([30, 90, 200]))
             .expect("blue layer");
-        assert!(!blue.shapes.is_empty());
+        assert_ne!(blue.shapes.len(), 0);
         // Render-back (feature `metrics`): the pixel at the centre is white
         // (enclosed disc), the ring midway is blue, the corner is background.
         #[cfg(feature = "metrics")]
