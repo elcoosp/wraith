@@ -142,7 +142,9 @@ fn flood_remove_background(
             stack.push(i);
         }
     }
+    let mut removed_any = false;
     while let Some(i) = stack.pop() {
+        removed_any = true;
         rgba[i * 4 + 3] = 0;
         let (x, y) = (i % width, i / width);
         let neighbours = [
@@ -155,6 +157,140 @@ fn flood_remove_background(
             if !visited[n] && matches(&rgba[n * 4..n * 4 + 4]) {
                 visited[n] = true;
                 stack.push(n);
+            }
+        }
+    }
+
+    if !removed_any {
+        return;
+    }
+
+    // Decontaminate 2-px anti-aliased fringe bordering the removed background:
+    // recover true sub-pixel alpha and unpremultiply background colour bleed.
+    let mut fringe = vec![false; width * height];
+    let mut frontier = visited.clone();
+    for _ in 0..2 {
+        let prev = frontier.clone();
+        for y in 0..height {
+            let row = y * width;
+            for x in 0..width {
+                let idx = row + x;
+                if prev[idx] {
+                    continue;
+                }
+                let adj = (x > 0 && prev[idx - 1])
+                    || (x + 1 < width && prev[idx + 1])
+                    || (y > 0 && prev[idx - width])
+                    || (y + 1 < height && prev[idx + width]);
+                if adj {
+                    fringe[idx] = true;
+                    frontier[idx] = true;
+                }
+            }
+        }
+    }
+
+    let orig = rgba.to_vec();
+    for y in 0..height {
+        let row = y * width;
+        for x in 0..width {
+            let idx = row + x;
+            if !fringe[idx] || orig[idx * 4 + 3] < 255 {
+                continue;
+            }
+            // Locate nearest deep-interior (!frontier) pixel in 5x5 window,
+            // falling back to any non-fringe (!fringe) pixel for 1-2px thin strokes.
+            let mut best_score = usize::MAX;
+            let mut fg = [orig[idx * 4], orig[idx * 4 + 1], orig[idx * 4 + 2]];
+            let y0 = y.saturating_sub(2);
+            let y1 = (y + 2).min(height - 1);
+            let x0 = x.saturating_sub(2);
+            let x1 = (x + 2).min(width - 1);
+            for ny in y0..=y1 {
+                let nrow = ny * width;
+                for nx in x0..=x1 {
+                    let nidx = nrow + nx;
+                    if !fringe[nidx] && orig[nidx * 4 + 3] == 255 {
+                        let dx = x.abs_diff(nx);
+                        let dy = y.abs_diff(ny);
+                        let tier = if frontier[nidx] { 100 } else { 0 };
+                        let score = tier + dx * dx + dy * dy;
+                        if score < best_score {
+                            best_score = score;
+                            fg = [orig[nidx * 4], orig[nidx * 4 + 1], orig[nidx * 4 + 2]];
+                        }
+                    }
+                }
+            }
+            // Fallback for 1-2px thin strokes where every neighbour is within 2px of background:
+            // pick the opaque neighbour furthest in RGB from the background colour.
+            if best_score == usize::MAX {
+                let mut max_dist = 0_i32;
+                for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                    let nrow = ny * width;
+                    for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                        let nidx = nrow + nx;
+                        if !visited[nidx] && orig[nidx * 4 + 3] == 255 {
+                            let d = (i32::from(rgb[0]) - i32::from(orig[nidx * 4])).abs()
+                                + (i32::from(rgb[1]) - i32::from(orig[nidx * 4 + 1])).abs()
+                                + (i32::from(rgb[2]) - i32::from(orig[nidx * 4 + 2])).abs();
+                            if d > max_dist {
+                                max_dist = d;
+                                fg = [orig[nidx * 4], orig[nidx * 4 + 1], orig[nidx * 4 + 2]];
+                            }
+                        }
+                    }
+                }
+                if max_dist <= 20 {
+                    continue;
+                }
+            }
+            let obs = [orig[idx * 4], orig[idx * 4 + 1], orig[idx * 4 + 2]];
+            let mut num = 0.0_f32;
+            let mut den = 0.0_f32;
+            let to_lin = |u: u8| -> f32 {
+                let s = f32::from(u) / 255.0;
+                if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+            };
+            for c in 0..3 {
+                let diff_srgb = (f32::from(rgb[c]) - f32::from(fg[c])).abs();
+                if diff_srgb > 20.0 {
+                    let l_bg = to_lin(rgb[c]);
+                    let l_fg = to_lin(fg[c]);
+                    let l_obs = to_lin(obs[c]);
+                    let diff = l_bg - l_fg;
+                    num += (l_bg - l_obs) * diff;
+                    den += diff * diff;
+                }
+            }
+            if den <= 0.0 {
+                continue;
+            }
+            let a = (num / den).clamp(0.0, 1.0);
+            let from_lin = |l: f32| -> u8 {
+                let s = if l <= 0.003_130_8 {
+                    12.92 * l
+                } else {
+                    1.055 * l.powf(1.0 / 2.4) - 0.055
+                };
+                (s.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            if a < 0.04 {
+                rgba[idx * 4 + 3] = 0;
+            } else if a < 0.96 {
+                let fg_luma = 0.299 * f32::from(fg[0]) + 0.587 * f32::from(fg[1]) + 0.114 * f32::from(fg[2]);
+                let a_out = if fg_luma < 75.0 && a >= 0.28 {
+                    (a * 1.35).min(1.0)
+                } else {
+                    a
+                };
+                rgba[idx * 4 + 3] = (a_out * 255.0).round() as u8;
+                for c in 0..3 {
+                    let l_bg = to_lin(rgb[c]);
+                    let l_obs = to_lin(obs[c]);
+                    let l_unmixed = ((l_obs - (1.0 - a) * l_bg) / a).clamp(0.0, 1.0);
+                    rgba[idx * 4 + c] = from_lin(l_unmixed);
+                }
             }
         }
     }
@@ -375,5 +511,25 @@ mod tests {
         // The white background is now transparent; the black square is intact.
         assert_eq!(prepared.image.pixels[3], 0);
         assert_eq!(prepared.image.pixels[(8 * 16 + 8) * 4 + 3], 255);
+    }
+
+    #[test]
+    fn background_flood_decontaminates_antialiased_fringe() {
+        let (w, h) = (10usize, 10usize);
+        let mut rgba = vec![255u8; w * h * 4];
+        let at = |x: usize, y: usize| (y * w + x) * 4;
+        for y in 2..8 {
+            for x in 2..8 {
+                rgba[at(x, y)..at(x, y) + 3].fill(0);
+            }
+        }
+        rgba[at(1, 5)..at(1, 5) + 3].fill(128);
+        let white = [u8::MAX; 3];
+        flood_remove_background(&mut rgba, w, h, white, 8);
+        assert_eq!(rgba[at(0, 0) + 3], 0);
+        assert_eq!(rgba[at(5, 5)], 0);
+        assert_eq!(rgba[at(5, 5) + 3], 255);
+        assert!(rgba[at(1, 5)] < 20, "fringe RGB should unpremultiply toward black, got {}", rgba[at(1, 5)]);
+        assert!((110..=255).contains(&rgba[at(1, 5) + 3]), "fringe alpha should be boosted in 110..=255, got {}", rgba[at(1, 5) + 3]);
     }
 }
