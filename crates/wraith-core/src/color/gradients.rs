@@ -84,7 +84,7 @@ struct RadialFit {
 }
 
 /// Per-region classification.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionKind {
     /// Single palette rank, solid palette colour.
     Flat,
@@ -555,7 +555,7 @@ fn binned_radial_residual(rf: &RadialFit, uniques: &Uniques, px: &[u32]) -> f64 
         .map(|p| {
             let dx = p.x - rf.cx;
             let dy = p.y - rf.cy;
-            ((dx * dx + dy * dy).sqrt(), p)
+            (dx.hypot(dy), p)
         })
         .collect();
     proj.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -590,7 +590,7 @@ fn union_residual(uniques: &Uniques, px: &[u32], radial_enabled: bool) -> f64 {
         .min(fit_radial(uniques, px).map_or(f64::MAX, |r| binned_radial_residual(&r, uniques, px)))
 }
 
-fn coords(i: u32, w: usize) -> (f64, f64) {
+const fn coords(i: u32, w: usize) -> (f64, f64) {
     let i = i as usize;
     ((i % w) as f64, (i / w) as f64)
 }
@@ -700,7 +700,7 @@ fn solve3(m: &[f64; 9], rhs: &[f64; 3]) -> (f64, f64, f64) {
 fn dominant_eigen2(a: f64, b: f64, c: f64) -> [f64; 2] {
     let tr = a + c;
     let disc = ((a - c) * (a - c) + 4.0 * b * b).sqrt();
-    let lambda = (tr + disc) * 0.5;
+    let lambda = f64::midpoint(tr, disc);
     let v1 = [b, lambda - a];
     let v2 = [lambda - c, b];
     let v = if v1[0] * v1[0] + v1[1] * v1[1] >= v2[0] * v2[0] + v2[1] * v2[1] {
@@ -708,7 +708,7 @@ fn dominant_eigen2(a: f64, b: f64, c: f64) -> [f64; 2] {
     } else {
         v2
     };
-    let n = (v[0] * v[0] + v[1] * v[1]).sqrt();
+    let n = v[0].hypot(v[1]);
     if n < 1e-12 {
         // Degenerate (diagonal) matrix: axes are the coordinate axes.
         return if a >= c { [1.0, 0.0] } else { [0.0, 1.0] };
@@ -879,7 +879,7 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
     for _ in 0..6 {
         let radii: Vec<f64> = s
             .iter()
-            .map(|p| ((p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy)).sqrt())
+            .map(|p| (p.x - cx).hypot(p.y - cy))
             .collect();
         let rmean = radii.iter().sum::<f64>() / radii.len() as f64;
         let srr: f64 = radii.iter().map(|r| (r - rmean) * (r - rmean)).sum();
@@ -931,7 +931,7 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
         best_c = (cx, cy);
         best_span = radii.iter().copied().fold(0.0_f64, f64::max);
     }
-    if best == f64::MAX {
+    if !best.is_finite() || best >= f64::MAX {
         return None;
     }
     // The Gauss–Newton walk drifts on a quantised staircase (each ring is a
@@ -948,7 +948,7 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
     if (ccx - best_c.0).abs() > 0.5 || (ccy - best_c.1).abs() > 0.5 {
         let radii: Vec<f64> = s
             .iter()
-            .map(|p| ((p.x - ccx) * (p.x - ccx) + (p.y - ccy) * (p.y - ccy)).sqrt())
+            .map(|p| (p.x - ccx).hypot(p.y - ccy))
             .collect();
         let rmean = radii.iter().sum::<f64>() / radii.len() as f64;
         let srr: f64 = radii.iter().map(|r| (r - rmean) * (r - rmean)).sum();
@@ -1018,7 +1018,7 @@ fn radial_def(rf: &RadialFit, uniques: &Uniques, px: &[u32]) -> GradientDef {
     let w = uniques.width;
     let s = samples_of(uniques, px, w);
     let radius =
-        |p: &Sample| ((p.x - rf.cx) * (p.x - rf.cx) + (p.y - rf.cy) * (p.y - rf.cy)).sqrt();
+        |p: &Sample| (p.x - rf.cx).hypot(p.y - rf.cy);
     let nb = 24_usize;
     let (mut lo, mut hi) = (f64::MAX, f64::MIN);
     for p in &s {
@@ -1037,8 +1037,8 @@ fn radial_def(rf: &RadialFit, uniques: &Uniques, px: &[u32]) -> GradientDef {
             .clamp(0.0, (nb - 1) as f64) as usize;
         cnt[b] += 1.0;
         sr[b] += r;
-        for ch in 0..3 {
-            sc[b][ch] += f64::from(p.c[ch]);
+        for (dst, &src) in sc[b].iter_mut().zip(&p.c) {
+            *dst += f64::from(src);
         }
     }
     let mut bin_r: Vec<f64> = Vec::new();
@@ -1206,7 +1206,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let i = (y * w + x) * 4;
-                let r = ((((x as f64 - 95.5).powi(2) + (y as f64 - 95.5).powi(2)).sqrt() / 90.0)
+                let r = (((x as f64 - 95.5).hypot(y as f64 - 95.5) / 90.0)
                     .clamp(0.0, 1.0)
                     * 32.0)
                     .floor()
@@ -1224,7 +1224,7 @@ mod tests {
             .filter(|&p| {
                 let dx = (p % w) as f64 - 95.5;
                 let dy = (p / w) as f64 - 95.5;
-                (dx * dx + dy * dy).sqrt() < 90.0
+                dx.hypot(dy) < 90.0
             })
             .map(|p| p as u32)
             .collect();
