@@ -279,6 +279,14 @@ pub struct Cli {
     )]
     pub refine: u8,
 
+    /// Binomial contour-smoothing iterations before curve fitting (0 = off, default 2).
+    #[arg(
+        long,
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u8).range(..=64)
+    )]
+    pub smooth: u8,
+
     /// Background removal: `none`, `alpha`, or a hex colour `#RRGGBB`.
     /// Hex backgrounds flood-remove border-connected matching regions
     /// (replaces 0.1.x `--strip-white`).
@@ -399,6 +407,7 @@ impl Cli {
         }
         s.color.primitives = !self.no_primitives;
         s.color.refine_iters = self.refine;
+        s.color.smooth_iters = self.smooth;
         s.legacy_color = wraith_core::LegacyColorSettings {
             color_precision: self
                 .color_precision
