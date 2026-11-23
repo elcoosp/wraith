@@ -243,7 +243,7 @@ mod tests {
     fn threshold_snaps_gray_and_white() {
         // Hand-built RGBA: mid-gray, white, near-black.
         let px = vec![128, 128, 128, 255, 255, 255, 255, 255, 10, 10, 10, 255];
-        let out = threshold_pixels(px.clone(), Some(128));
+        let out = threshold_pixels(px, Some(128));
         assert_eq!(&out[0..4], &[255, 255, 255, 255]); // 187 ≥ 128 → white
         assert_eq!(&out[4..8], &[255, 255, 255, 255]);
         assert_eq!(&out[8..12], &[0, 0, 0, 255]); // 10 < 128 → black
