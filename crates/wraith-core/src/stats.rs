@@ -23,14 +23,14 @@ pub enum Stage {
 impl Stage {
     /// Human-readable stage name, used by the CLI report.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Stage::Decode => "decode",
-            Stage::Preprocess => "preprocess",
-            Stage::Palette => "palette",
-            Stage::Trace => "trace",
-            Stage::Serialize => "serialize",
-            Stage::Minify => "minify",
+            Self::Decode => "decode",
+            Self::Preprocess => "preprocess",
+            Self::Palette => "palette",
+            Self::Trace => "trace",
+            Self::Serialize => "serialize",
+            Self::Minify => "minify",
         }
     }
 }
