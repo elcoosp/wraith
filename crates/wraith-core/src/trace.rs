@@ -11,11 +11,24 @@ use crate::stats::{Stage, Stopwatch};
 /// Returns [`crate::error::WraithError::Trace`] when the tracer rejects the
 /// image (practically only for pathological colour-mode inputs).
 pub fn trace(
-    image: vtracer::ColorImage,
+    mut image: vtracer::ColorImage,
     settings: &Settings,
     sw: &mut Stopwatch,
 ) -> Result<vtracer::SvgFile> {
     sw.start();
+    // vtracer ignores the alpha channel in colour mode; composite semi-transparent
+    // fringe pixels over white so unpremultiplied low-alpha edge pixels never turn
+    // into opaque dark specks.
+    for px in image.pixels.chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        if a < 255 {
+            for c in 0..3 {
+                let fg = u32::from(px[c]);
+                px[c] = ((fg * a + 255 * (255 - a) + 127) / 255) as u8;
+            }
+            px[3] = 255;
+        }
+    }
     let svg = vtracer::convert(image, settings.tracer_config()).map_err(WraithError::Trace);
     sw.lap(Stage::Trace);
     svg
