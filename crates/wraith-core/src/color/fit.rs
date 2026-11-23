@@ -356,7 +356,11 @@ fn gen_bezier(d: &[P], u: &[f64], t1: P, t2: P) -> Cubic {
         (0.0, 0.0)
     };
     let seg = len(sub(p3, p0));
-    if al < 1e-6 * seg || ar < 1e-6 * seg {
+    // Near-parallel end tangents yield tiny det = c00*c11 - c01^2 and huge
+    // positive alpha (thousands of pixels on a 1px chord), shooting needle
+    // spikes out of smooth segments. Fall back to symmetric 1/3 chord handles
+    // whenever alpha is negative or exceeds 3x chord length.
+    if al < 1e-6 * seg || ar < 1e-6 * seg || al > seg * 3.0 || ar > seg * 3.0 {
         al = seg / 3.0;
         ar = seg / 3.0;
     }
