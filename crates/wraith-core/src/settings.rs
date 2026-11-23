@@ -183,6 +183,8 @@ pub struct ColorSettings {
     pub primitives: bool,
     /// Field-driven refinement iterations (0 = off, roadmap M5).
     pub refine_iters: u8,
+    /// Binomial contour-smoothing rounds applied before curve fitting (0 = off, default 2).
+    pub smooth_iters: u8,
     /// Speck filter: rings below this signed area (px²) are dropped.
     pub min_area_px2: f32,
 }
@@ -198,6 +200,7 @@ impl Default for ColorSettings {
             gradients: Gradients::LinearRadial,
             primitives: true,
             refine_iters: 0,
+            smooth_iters: 2,
             min_area_px2: 2.0,
         }
     }
@@ -207,7 +210,7 @@ impl ColorSettings {
     /// Applies a [`ContentPreset`] over the current values; fields the preset
     /// does not care about are left untouched.
     #[must_use]
-    pub fn with_preset(mut self, preset: ContentPreset) -> Self {
+    pub const fn with_preset(mut self, preset: ContentPreset) -> Self {
         match preset {
             ContentPreset::Logo => {}
             ContentPreset::Icon => {
@@ -231,6 +234,7 @@ impl ColorSettings {
         self.corner_angle_deg = self.corner_angle_deg.clamp(5.0, 85.0);
         self.trap_px = self.trap_px.clamp(0.0, 3.0);
         self.min_area_px2 = self.min_area_px2.clamp(0.0, 1_000.0);
+        self.smooth_iters = self.smooth_iters.min(64);
         if let Colors::Max(n) = &mut self.max_colors {
             *n = (*n).clamp(1, 64);
         }
@@ -381,7 +385,7 @@ impl Settings {
     /// quality tier overrides the simplification knobs, and the remaining
     /// colour fields come from [`Settings::legacy_color`] rather than from
     /// the black-and-white preset.
-    fn color_config(&self) -> vtracer::Config {
+    const fn color_config(&self) -> vtracer::Config {
         let (mode, corner, length, iters, precision) = match self.quality {
             Quality::Fast => (
                 PathSimplifyMode::Polygon,
