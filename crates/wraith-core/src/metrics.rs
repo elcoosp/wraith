@@ -45,8 +45,8 @@ pub fn render_svg(svg: &str, width: u32, height: u32) -> Result<Vec<u8>> {
     resvg::render(
         &tree,
         resvg::tiny_skia::Transform::from_scale(
-            f32::from(width as u16) / tree.size().width() as f32,
-            f32::from(height as u16) / tree.size().height() as f32,
+            f32::from(width as u16) / tree.size().width(),
+            f32::from(height as u16) / tree.size().height(),
         ),
         &mut pm.as_mut(),
     );
