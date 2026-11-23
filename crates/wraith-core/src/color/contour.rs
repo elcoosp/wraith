@@ -39,9 +39,10 @@ pub fn contours(f: &[f32], pw: usize, ph: usize, active: &[TileSpan]) -> Vec<Vec
     contours_with(f, pw, ph, &mut nxt, active)
 }
 
-/// Marching squares with an externally owned chain table (M2: the table is
-/// reused across layers through the thread-local scratch pool). `active`
-/// restricts the cell scan and chain-start walk to the given tile spans.
+/// Marching squares with an externally owned chain table.
+///
+/// The table is reused across layers through the thread-local scratch pool.
+/// `active` restricts the cell scan and chain-start walk to the given tile spans.
 ///
 /// # Panics
 ///
@@ -226,7 +227,7 @@ mod tests {
         }
         f[0] = 0.0; // top-left lattice point at 0 → boundary crosses nearby
         let rings = contours(&f, pw, ph, &full_span(pw, ph));
-        assert!(!rings.is_empty());
+        assert_ne!(rings.len(), 0);
         // Some crossing point must lie strictly inside a lattice cell.
         let has_frac = rings
             .iter()
