@@ -220,16 +220,36 @@ fn kmeans(pts: &[V3], w: &[f32], k: usize, iters: usize) -> Vec<V3> {
     cent
 }
 
+/// Returns true when `c` is an achromatic highlight (`L > 0.80`, `C < 0.035` in Oklab),
+/// where subtle tonal steps carry deliberate shading structure rather than chroma noise.
+fn is_neutral_highlight(c: V3) -> bool {
+    let l = *c.first().unwrap_or(&0.0);
+    let a = *c.get(1).unwrap_or(&0.0);
+    let b = *c.get(2).unwrap_or(&0.0);
+    l > 0.80 && (a * a + b * b) < 0.035 * 0.035
+}
+
 /// Merges palette colours closer than `thr` (Oklab), weighted by pixel count.
+/// Tightens the threshold in achromatic highlights so soft white-surface shading survives.
 fn merge_close(pal: &mut Vec<V3>, cnt: &mut Vec<f64>, thr: f32) {
     loop {
         let mut best = None;
-        let mut bd = thr * thr;
+        let mut best_ratio = 1.0_f32;
         for i in 0..pal.len() {
             for j in i + 1..pal.len() {
-                let d = d2(pal[i], pal[j]);
-                if d < bd {
-                    bd = d;
+                let pi = pal.get(i).copied().unwrap_or_default();
+                let pj = pal.get(j).copied().unwrap_or_default();
+                let eff_thr = if is_neutral_highlight(pi) && is_neutral_highlight(pj) {
+                    thr * 0.45
+                } else {
+                    thr
+                };
+                if eff_thr <= 0.0 {
+                    continue;
+                }
+                let ratio = d2(pi, pj) / (eff_thr * eff_thr);
+                if ratio < best_ratio {
+                    best_ratio = ratio;
                     best = Some((i, j));
                 }
             }
@@ -238,9 +258,9 @@ fn merge_close(pal: &mut Vec<V3>, cnt: &mut Vec<f64>, thr: f32) {
             break;
         };
         let (wi, wj) = (cnt[i].max(1e-9), cnt[j].max(1e-9));
-        for c in 0..3 {
-            pal[i][c] =
-                ((f64::from(pal[i][c]) * wi + f64::from(pal[j][c]) * wj) / (wi + wj)) as f32;
+        let pj = pal[j];
+        for (ch, dst) in pal[i].iter_mut().enumerate() {
+            *dst = ((f64::from(*dst) * wi + f64::from(pj[ch]) * wj) / (wi + wj)) as f32;
         }
         cnt[i] += cnt[j];
         pal.swap_remove(j);
