@@ -267,10 +267,21 @@ pub(crate) fn smooth_ring(r: &mut [P], cor: &[bool], iters: usize) {
             if cor[i] {
                 continue;
             }
+            let d1 = cor[(i + n - 1) % n] || cor[(i + 1) % n];
+            let d2 = cor[(i + n - 2) % n] || cor[(i + 2) % n];
+            let w = if d1 {
+                0.25
+            } else if d2 {
+                0.5
+            } else {
+                1.0
+            };
             let (a, b) = (old[(i + n - 1) % n], old[(i + 1) % n]);
+            let avg_x = (a[0] + 2.0 * old[i][0] + b[0]) * 0.25;
+            let avg_y = (a[1] + 2.0 * old[i][1] + b[1]) * 0.25;
             r[i] = [
-                (a[0] + 2.0 * old[i][0] + b[0]) * 0.25,
-                (a[1] + 2.0 * old[i][1] + b[1]) * 0.25,
+                old[i][0] + w * (avg_x - old[i][0]),
+                old[i][1] + w * (avg_y - old[i][1]),
             ];
         }
     }
@@ -469,9 +480,10 @@ pub fn tls_line(pts: &[P]) -> (P, P, f64) {
     (c, d, dev)
 }
 
-/// Fits one closed ring: cuts at corners (or at two synthetic cuts when the
-/// ring is corner-free), snaps straight pieces to their TLS line, restores
-/// corners as line intersections, and Schneider-fits the curved remainder.
+/// Fits one closed ring into straight lines and cubic Bézier curves.
+///
+/// Cuts at corners (or two synthetic cuts when corner-free), snaps straight
+/// pieces to their TLS line, restores corners, and Schneider-fits curves.
 #[must_use]
 pub fn fit_ring(ring: &[P], corner: &[bool], tol: f64) -> (P, Vec<Seg>) {
     let n = ring.len();
@@ -638,7 +650,7 @@ mod tests {
         let t2 = [1.0, 0.0];
         let mut out = Vec::new();
         fit_cubic(&arc, t1, t2, 0.3_f64 * 0.3, &mut out);
-        assert!(!out.is_empty());
+        assert_ne!(out.len(), 0);
         // Max deviation of the union of cubics vs the source arc.
         for c in &out {
             for i in 0..=32 {
@@ -660,8 +672,7 @@ mod tests {
         assert_eq!(segs.len(), 4);
         assert!(segs.iter().all(|s| matches!(s, Seg::Line(_))));
         // Corners restored to exact intersections.
-        let ends = [start]
-            .into_iter()
+        let ends = std::iter::once(start)
             .chain(segs.iter().map(|s| match s {
                 Seg::Line(p) | Seg::Cubic(_, _, p) | Seg::Arc { p, .. } => *p,
             }))
