@@ -91,9 +91,10 @@ fn residual(
     acc
 }
 
-/// Refines the interior control points of all cubic segments against the
-/// coverage field. Returns `true` when the refined version was accepted
-/// (lower residual); `false` when the original segments were restored.
+/// Refines interior control points of cubic segments against the coverage field.
+///
+/// Returns `true` when the refined version was accepted (lower residual),
+/// or `false` when the original segments were restored.
 pub fn refine_ring(
     field: &[f32],
     spw: usize,
