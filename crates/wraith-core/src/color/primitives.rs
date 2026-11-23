@@ -32,7 +32,7 @@ fn circumcircle(a: P, b: P, c: P) -> Option<(f64, f64, f64)> {
     let c2 = c[0] * c[0] + c[1] * c[1];
     let cx = (a2 * (b[1] - c[1]) + b2 * (c[1] - a[1]) + c2 * (a[1] - b[1])) / d;
     let cy = (a2 * (c[0] - b[0]) + b2 * (a[0] - c[0]) + c2 * (b[0] - a[0])) / d;
-    let r = ((a[0] - cx) * (a[0] - cx) + (a[1] - cy) * (a[1] - cy)).sqrt();
+    let r = (a[0] - cx).hypot(a[1] - cy);
     if !r.is_finite() || r < 1e-9 {
         return None;
     }
@@ -43,7 +43,7 @@ fn circumcircle(a: P, b: P, c: P) -> Option<(f64, f64, f64)> {
 fn circle_dev(pts: &[P], cx: f64, cy: f64, r: f64) -> f64 {
     pts.iter()
         .map(|p| {
-            let d = ((p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy)).sqrt();
+            let d = (p[0] - cx).hypot(p[1] - cy);
             (d - r).abs()
         })
         .fold(0.0_f64, f64::max)
@@ -73,7 +73,7 @@ fn ellipse_fit(pts: &[P]) -> Option<(f64, f64, f64, f64, f64)> {
     syy /= n;
     let tr = sxx + syy;
     let disc = ((sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy).sqrt();
-    let (l1, l2) = ((tr + disc) * 0.5, (tr - disc) * 0.5);
+    let (l1, l2) = (f64::midpoint(tr, disc), (tr - disc) * 0.5);
     if l2 <= 1e-9 {
         return None;
     }
@@ -99,7 +99,7 @@ fn ellipse_dev(pts: &[P], cx: f64, cy: f64, rx: f64, ry: f64, theta_deg: f64) ->
         // Rotate into ellipse frame; normalise to a unit circle; the residual
         // is the radial distance of the normalised point from 1.
         let (ex, ey) = (dx * ct + dy * st, -dx * st + dy * ct);
-        let norm = ((ex / rx) * (ex / rx) + (ey / ry) * (ey / ry)).sqrt();
+        let norm = (ex / rx).hypot(ey / ry);
         let dev = (norm - 1.0) * rx.min(ry);
         max_dev = max_dev.max(dev.abs());
     }
@@ -116,7 +116,7 @@ pub fn detect_ring(dense: &[P], start: P, segs: &[Seg], tol: f64) -> Option<Shap
     if !has_lines {
         if let Some((cx, cy, rx, ry, theta)) = ellipse_fit(dense) {
             if (rx - ry).abs() <= 0.02 * rx.max(ry) {
-                let r = (rx + ry) * 0.5;
+                let r = f64::midpoint(rx, ry);
                 if ellipse_dev(dense, cx, cy, r, r, 0.0) < prim_tol {
                     return Some(Shape::Circle { cx, cy, r });
                 }
@@ -135,7 +135,7 @@ pub fn detect_ring(dense: &[P], start: P, segs: &[Seg], tol: f64) -> Option<Shap
         match seg {
             Seg::Line(p) => {
                 let (dx, dy) = (p[0] - cur[0], p[1] - cur[1]);
-                let l = (dx * dx + dy * dy).sqrt();
+                let l = dx.hypot(dy);
                 if l < 1e-9 {
                     return None;
                 }
@@ -178,9 +178,10 @@ pub fn detect_ring(dense: &[P], start: P, segs: &[Seg], tol: f64) -> Option<Shap
     None
 }
 
-/// Ring-aware arc rewriting: a fitted cubic that a circle explains within
-/// tolerance becomes an SVG `A` segment. Endpoints (shared with neighbouring
-/// segments) stay untouched, so G1 continuity at joins is preserved.
+/// Ring-aware arc rewriting for circular cubic segments.
+///
+/// A fitted cubic that a circle explains within tolerance becomes an SVG `A`
+/// segment. Endpoints stay untouched so G1 continuity at joins is preserved.
 #[must_use]
 pub fn arcs_for_ring(start: P, segs: &[Seg], tol: f64) -> Vec<Seg> {
     let arc_tol = tol.max(0.2);
