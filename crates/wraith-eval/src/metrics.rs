@@ -130,7 +130,7 @@ mod tests {
         let rgb = render_rgb(svg, 8, 2).expect("renders");
         assert_eq!(rgb.len(), 16 * 16 * 3);
         // Blue channel dominates everywhere.
-        assert!(rgb.chunks_exact(3).all(|p| p[2] > 200));
+        assert!(rgb.as_chunks::<3>().0.iter().all(|p| p[2] > 200));
     }
 
     #[test]
