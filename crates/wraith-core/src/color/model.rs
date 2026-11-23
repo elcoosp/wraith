@@ -36,9 +36,10 @@ pub fn seg_fit(p: V3, a: V3, b: V3) -> (f32, f32) {
     (d2(p, q), t)
 }
 
-/// Builds the mixture model with **best-pair** selection (prototype §4.3):
-/// not "nearest colour, then its best partner", but the best
-/// (dominant, partner) pair among the four nearest dominant candidates.
+/// Builds the mixture model with **best-pair** selection (prototype §4.3).
+///
+/// Evaluates the best (dominant, partner) pair among the four nearest
+/// dominant candidates rather than greedy nearest-first matching.
 /// Nearest-first alone produced a red fringe on yellow/blue edges because a
 /// mixed pixel's nearest centroid can be an unrelated colour.
 ///
