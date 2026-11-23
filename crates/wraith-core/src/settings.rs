@@ -409,6 +409,13 @@ impl Settings {
                 Some(3_u32),
             ),
         };
+        // Allow explicit --corner-angle to tune legacy corner detection while
+        // preserving exact 0.1.x quality defaults when corner_angle_deg == 40.0.
+        let corner_thresh = if (self.color.corner_angle_deg - 40.0).abs() > f32::EPSILON {
+            self.color.corner_angle_deg.round().clamp(1.0, 180.0) as i32
+        } else {
+            corner
+        };
         vtracer::Config {
             color_mode: vtracer::ColorMode::Color,
             hierarchical: match self.legacy_color.hierarchy {
@@ -419,7 +426,7 @@ impl Settings {
             color_precision: self.legacy_color.color_precision,
             layer_difference: self.legacy_color.layer_difference,
             mode,
-            corner_threshold: corner,
+            corner_threshold: corner_thresh,
             length_threshold: length,
             max_iterations: iters,
             splice_threshold: 45,
