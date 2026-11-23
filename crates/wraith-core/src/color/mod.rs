@@ -113,7 +113,7 @@ pub enum Shape {
 }
 
 /// Fill of one layer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Paint {
     /// Opaque sRGB colour.
     Solid([u8; 3]),
@@ -278,7 +278,7 @@ mod tests {
             .iter()
             .find(|l| l.paint == Paint::Solid([200, 30, 30]))
             .expect("red layer");
-        assert!(!red.shapes.is_empty());
+        assert_ne!(red.shapes.len(), 0);
     }
 
     #[test]
