@@ -2,3 +2,5 @@
 
 # local shipping helper (deliverable lives next to the zip, never committed)
 ship.sh
+ship.toml
+.github/pr-body.md
