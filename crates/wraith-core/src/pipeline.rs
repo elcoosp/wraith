@@ -8,7 +8,7 @@ use crate::color;
 use crate::error::Result;
 use crate::preprocess::prepare;
 use crate::settings::{Engine, Mode, Settings};
-use crate::stats::{ConvertStats, Stopwatch};
+use crate::stats::{ConvertStats, Stage, Stopwatch};
 use crate::svgout::serialize;
 use crate::trace::trace;
 
@@ -46,6 +46,9 @@ pub fn convert(png: &[u8], settings: &Settings) -> Result<Output> {
         );
         let dims = (traced.width, traced.height);
         let canonical = color::write::write_svg(&traced);
+        // The stopwatch chains from the trace lap (see `Stopwatch::lap`), so
+        // serialization is timed without an explicit restart.
+        sw.lap(Stage::Serialize);
         let paths: usize = traced.layers.iter().map(|l| l.shapes.len()).sum();
         (dims, canonical, traced.palette_size, paths)
     };
@@ -68,6 +71,8 @@ pub fn convert(png: &[u8], settings: &Settings) -> Result<Output> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::preprocess::fixture_png;
     use crate::settings::{Engine, Gradients, Minify, Mode, Quality, Settings};
 
@@ -144,6 +149,34 @@ mod tests {
                 .iter()
                 .any(|(s, _)| *s == crate::stats::Stage::Palette)
         );
+    }
+
+    /// The geometric path must report nonzero wall-clock time for every
+    /// stage it runs. The palette/trace laps used to record 0.00 ms because
+    /// nothing restarted the stopwatch between stages, hiding the real hot
+    /// spots from `--stats` tuning.
+    #[test]
+    fn geometric_timings_are_nonzero_per_stage() {
+        let png = fixture_png(128);
+        let cfg = Settings {
+            mode: Mode::Color,
+            ..Settings::new()
+        };
+        let out = convert(&png, &cfg).expect("converts");
+        for stage in [
+            crate::stats::Stage::Palette,
+            crate::stats::Stage::Trace,
+            crate::stats::Stage::Serialize,
+        ] {
+            let d = out
+                .stats
+                .timings
+                .iter()
+                .find(|(s, _)| *s == stage)
+                .map(|(_, d)| *d)
+                .unwrap_or_default();
+            assert!(d > Duration::ZERO, "{stage:?} recorded {d:?}");
+        }
     }
 
     #[test]
