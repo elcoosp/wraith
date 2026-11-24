@@ -262,6 +262,18 @@ pub struct Cli {
     #[arg(long, value_name = "PX2")]
     pub min_area: Option<f32>,
 
+    /// Enable the bilateral pre-denoise (off by default; softens edges).
+    #[arg(long)]
+    pub prefilter: bool,
+
+    /// Coverage-field blur passes before contouring, 0-3 (default 1).
+    #[arg(long, value_name = "N")]
+    pub field_blur: Option<u8>,
+
+    /// Use the global best-pair mixture instead of the 5x5-local one.
+    #[arg(long)]
+    pub no_local_mixture: bool,
+
     /// Gradient detection/fitting: `off`, `linear` or `linear-radial`.
     #[arg(long, value_enum)]
     pub gradients: Option<GradientsArg>,
@@ -397,6 +409,13 @@ impl Cli {
         }
         if let Some(v) = self.min_area {
             s.color.min_area_px2 = v;
+        }
+        s.color.prefilter = self.prefilter;
+        if let Some(v) = self.field_blur {
+            s.color.field_blur = v;
+        }
+        if self.no_local_mixture {
+            s.color.local_mixture = false;
         }
         if let Some(g) = self.gradients {
             s.color.gradients = match g {
