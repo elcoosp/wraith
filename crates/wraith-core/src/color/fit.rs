@@ -567,13 +567,113 @@ pub fn fit_ring(ring: &[P], corner: &[bool], tol: f64) -> (P, Vec<Seg>) {
         } else {
             unit(sub(arc_pt(ring, e, -1, 1.5), ring[e]))
         };
-        let mut cs = Vec::new();
-        fit_cubic(piece, t1, t2, tol * tol, &mut cs);
-        for c in cs {
-            segs.push(Seg::Cubic(c[1], c[2], c[3]));
-        }
+        fit_piece_with_straight_runs(piece, t1, t2, tol, &mut segs);
     }
     (cpos[0], segs)
+}
+
+/// Checks whether `sub_pts` is a genuinely straight run rather than a shallow
+/// circular arc using a line-deviation bound and a quadratic-residual (sagitta)
+/// test: on a real arc, signed deviations from the chord all share one sign so
+/// `|mean_signed| / max_dev` approaches `2/3`, whereas on a straight line with
+/// marching-squares jitter, signed deviations oscillate around zero.
+fn is_straight_run(sub_pts: &[P], tol: f64) -> bool {
+    let m = sub_pts.len();
+    if m < 4 {
+        return false;
+    }
+    let a = sub_pts[0];
+    let b = sub_pts[m - 1];
+    let ab = sub(b, a);
+    let chord = len(ab);
+    if chord < 5.0 {
+        return false;
+    }
+    let inv_chord = 1.0 / chord;
+    let nx = -ab[1] * inv_chord;
+    let ny = ab[0] * inv_chord;
+    let dev_limit = (tol * 0.65).max(0.14);
+    let mut max_dev = 0.0_f64;
+    let mut signed_sum = 0.0_f64;
+    for p in &sub_pts[1..m - 1] {
+        let dx = p[0] - a[0];
+        let dy = p[1] - a[1];
+        let along = (dx * ab[0] + dy * ab[1]) * inv_chord;
+        if along < -0.25 || along > chord + 0.25 {
+            return false;
+        }
+        let sd = dx * nx + dy * ny;
+        let ad = sd.abs();
+        if ad > dev_limit {
+            return false;
+        }
+        if ad > max_dev {
+            max_dev = ad;
+        }
+        signed_sum += sd;
+    }
+    let mean_signed = (signed_sum / ((m - 2) as f64)).abs();
+    max_dev < 0.08 || mean_signed <= max_dev * 0.38
+}
+
+/// Splits an open piece into maximal straight runs (`Seg::Line`) and smooth
+/// curved runs (`fit_cubic` -> `Seg::Cubic`) with continuous tangents at joins.
+fn fit_piece_with_straight_runs(piece: &[P], t1: P, t2: P, tol: f64, segs: &mut Vec<Seg>) {
+    let n = piece.len();
+    let e2 = tol * tol;
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    let mut i = 0_usize;
+    let mut curve_start = 0_usize;
+
+    while i + 3 < n {
+        let mut best_j = None;
+        for j in (i + 3..n).rev() {
+            if is_straight_run(&piece[i..=j], tol) {
+                best_j = Some(j);
+                break;
+            }
+        }
+        if let Some(j) = best_j {
+            if i > curve_start {
+                runs.push((curve_start, i, false));
+            }
+            runs.push((i, j, true));
+            i = j;
+            curve_start = j;
+        } else {
+            i += 1;
+        }
+    }
+    if curve_start < n - 1 {
+        runs.push((curve_start, n - 1, false));
+    }
+
+    let rcount = runs.len();
+    for (idx, &(s, e, straight)) in runs.iter().enumerate() {
+        if straight {
+            segs.push(Seg::Line(piece[e]));
+        } else {
+            let st = if idx == 0 {
+                t1
+            } else if runs[idx - 1].2 {
+                unit(sub(piece[s], piece[runs[idx - 1].0]))
+            } else {
+                unit(sub(piece[(s + 1).min(e)], piece[s]))
+            };
+            let et = if idx + 1 == rcount {
+                t2
+            } else if runs[idx + 1].2 {
+                unit(sub(piece[e], piece[runs[idx + 1].1]))
+            } else {
+                unit(sub(piece[e.saturating_sub(1)], piece[e]))
+            };
+            let mut cs = Vec::new();
+            fit_cubic(&piece[s..=e], st, et, e2, &mut cs);
+            for c in cs {
+                segs.push(Seg::Cubic(c[1], c[2], c[3]));
+            }
+        }
+    }
 }
 
 /// Fits many rings in parallel (M2: rings are independent).
