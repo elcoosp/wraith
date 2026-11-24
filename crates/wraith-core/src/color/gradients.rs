@@ -261,7 +261,6 @@ pub fn detect_regions(
     // chains form before any big flat region can contaminate them.
     pairs.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let delta = 2.0 / 255.0;
     let radial_on = matches!(settings.gradients, Gradients::LinearRadial);
     let mut merged: Vec<Vec<usize>> = Vec::new(); // accepted groups (rank lists)
     for &(boundary, _d_mean, a, b) in &pairs {
@@ -280,9 +279,26 @@ pub fn detect_regions(
         let union_px = balanced_union(&pixels_per_root[ra], &pixels_per_root[rb]);
         // Pairwise gate: the union must be consistent under the affine model
         // *or* — when enabled — the radial model (a curved ramp is affine
-        // only while the merged ring stays thin). MDL, width and rank-count
-        // gates apply to the *final* group.
-        if union_residual(uniques, &union_px, radial_on) < delta {
+        // only while the merged ring stays thin). The residual is per-pixel
+        // RMS against the model the renderer will evaluate — the roadmap M3
+        // definition of "consistent". MDL, width and rank-count gates apply
+        // to the *final* group.
+        // Ordering gate: the two sides must be distinct segments of the
+        // projection axis, not interleaved texture shades (see
+        // [`ranks_ordered_along`]).
+        let ordered = |fit: Option<LinearFit>, radial: Option<RadialFit>| -> bool {
+            if let Some(f) = &fit {
+                return ranks_ordered_along(linear_proj(f), uniques, &union_px, &lab);
+            }
+            if let Some(r) = &radial {
+                return ranks_ordered_along(radial_proj(r), uniques, &union_px, &lab);
+            }
+            false
+        };
+        let lin_fit = fit_linear_sample(uniques, &union_px);
+        let rad_fit = radial_on.then(|| fit_radial(uniques, &union_px)).flatten();
+        let residual = union_residual(uniques, &union_px, radial_on);
+        if residual < DELTA_ABS && ordered(lin_fit, rad_fit) {
             parent[rb] = ra;
             pixels_per_root[ra] = concat_all(&pixels_per_root[ra], &pixels_per_root[rb]);
             pixels_per_root[rb].clear();
@@ -315,22 +331,37 @@ pub fn detect_regions(
         if ranks.len() < 3 {
             continue;
         }
-        // Balanced per-rank sample so no single rank dominates the fit.
-        let px: Vec<u32> = ranks
-            .iter()
-            .flat_map(|&r| sample_cap(&rank_pixels[r], 512))
-            .collect();
+        // Population-representative sample: the fit and its residual must
+        // describe the region's real pixel distribution, not a per-rank
+        // balanced mix (see [`population_sample`]).
+        let px = population_sample(&rank_pixels, ranks, 8192);
         let fit = fit_linear_sample(uniques, &px);
-        let affine_rmse = fit.map_or(f64::MAX, |f| binned_linear_residual(&f, uniques, &px));
-        let residual = if radial_enabled {
-            affine_rmse.min(
-                fit_radial(uniques, &px)
-                    .map_or(f64::MAX, |r| binned_radial_residual(&r, uniques, &px)),
-            )
+        let linear = fit.as_ref().map_or(f64::MAX, |f| {
+            bin_profile_residual(uniques, &px, linear_proj(f), f.rmse)
+        });
+        let radial_fit = if radial_enabled {
+            fit_radial(uniques, &px)
         } else {
-            affine_rmse
+            None
         };
-        if residual >= delta {
+        let radial = radial_fit.as_ref().map_or(f64::MAX, |r| {
+            bin_profile_residual(uniques, &px, radial_proj(r), r.rmse)
+        });
+        // Final gates: the rendered gradient (bin-profile residual) must
+        // beat the flat-band fallback's per-pixel error
+        // ([`gradient_bound`]), and the group's ranks must be ordered along
+        // the winning model's axis (see [`ranks_ordered_along`]).
+        let flat_pp = flat_baseline_rmse(uniques, &px, &lab);
+        if linear.min(radial) >= gradient_bound(flat_pp) {
+            continue;
+        }
+        let ordered = if radial < linear {
+            ranks_ordered_along(radial_proj(radial_fit.as_ref().expect("radial won")), uniques, &px, &lab)
+        } else {
+            fit.as_ref()
+                .is_some_and(|f| ranks_ordered_along(linear_proj(f), uniques, &px, &lab))
+        };
+        if !ordered {
             continue;
         }
         // True pixel count (the fit sample is capped per rank and would
@@ -457,6 +488,35 @@ fn sample_cap(px: &[u32], cap: usize) -> Vec<u32> {
     (0..px.len()).step_by(stride).map(|i| px[i]).collect()
 }
 
+/// Population-representative sample of a *group* of ranks: every rank keeps
+/// its true share of the sample (total capped at `cap`), so the fitted model
+/// and its residual describe the region as the renderer sees it.
+///
+/// The pairwise merge gate deliberately samples each side balanced
+/// ([`balanced_union`]) so a huge background cannot drown a small stripe in a
+/// merge *decision*; reusing that balance for the final group fit was
+/// measured to tilt gradients toward minority bands — on the mascot corpus a
+/// bright chest area merged with darker hip shades came out ΔRGB 23–31 too
+/// dark across ~47 000 px because the chest's single dominant rank was
+/// capped to 512 samples while four dark shade ranks contributed 4 × 512.
+fn population_sample(rank_pixels: &[Vec<u32>], ranks: &[usize], cap: usize) -> Vec<u32> {
+    let total: usize = ranks.iter().map(|&r| rank_pixels[r].len()).sum();
+    if total <= cap {
+        return ranks.iter().flat_map(|&r| rank_pixels[r].iter().copied()).collect();
+    }
+    let mut out = Vec::with_capacity(cap);
+    for (k, &r) in ranks.iter().enumerate() {
+        // Last rank absorbs the rounding remainder so `out` never exceeds cap.
+        let share = if k + 1 == ranks.len() {
+            cap - out.len()
+        } else {
+            (u64::from(rank_pixels[r].len() as u32) * cap as u64 / total as u64).max(1) as usize
+        };
+        out.extend(sample_cap(&rank_pixels[r], share));
+    }
+    out
+}
+
 /// Balanced union of two pixel lists: each side is capped independently so a
 /// huge rank cannot drown a small one in the fit sample.
 fn balanced_union(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -483,54 +543,238 @@ fn oklab_dist(a: V3, b: V3) -> f64 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-/// Number of bins for the quantisation-immune residual evaluation.
+/// Number of projection bins for the piecewise-profile residual.
 const RESIDUAL_BINS: usize = 16;
 
-/// Residual of the affine model on projection-binned mean colours.
+/// Flat-band parity factor of the final acceptance bound.
 ///
-/// A resvg-rendered ramp is quantised to 8-bit colours, so per-pixel
-/// residuals carry a staircase floor of ~half a band step — which for
-/// over-segmented palettes exceeds the merge threshold `delta` and made
-/// every radial merge impossible. Binning along the fitted axis averages
-/// the staircase out: bin means of a true ramp sit on the model (residual
-/// ≈ 0) while a fake merge (flat + ramp, two different ramps) keeps large
-/// bin-mean deviations.
+/// The final gate must compare the two representations the engine actually
+/// chooses between: rendering the group as one gradient (per-pixel error =
+/// [`bin_profile_residual`], the bin profile the emitted stops interpolate)
+/// or as flat bands (per-pixel error = deviation of each pixel from its own
+/// rank's mean colour — the palette centroid it would be filled with).
+/// A gradient is accepted when it beats that flat baseline by
+/// [`FLAT_PARITY`], or meets [`DELTA_ABS`] outright.
+///
+/// This is what lets deliberately banded shading (band steps of several
+/// 1/255, where *any* smooth ramp leaves ≈ step/2) keep merging — the flat
+/// fallback leaves more, because the global palette's centroids drift along
+/// ramps — while a spatially mixed group (a bright facet merged with darker
+/// shades sharing the same projection range) leaves ≈ half the mix gap on
+/// every pixel, far above its flat baseline, and is rejected.
+const FLAT_PARITY: f64 = 1.1;
+
+/// Per-pixel RMS of the sample against the flat-band representation: each
+/// pixel compared to the mean colour of its dominant rank within the sample
+/// (≈ the palette centroid that region would render with). Normalised to
+/// 0..1, matching the fit residuals.
+fn flat_baseline_rmse(uniques: &Uniques, px: &[u32], lab: &[u8]) -> f64 {
+    let mut sum = [[0.0_f64; 4]; 256];
+    for &i in px {
+        let i = i as usize;
+        let l = lab[i] as usize;
+        if l >= 256 {
+            continue;
+        }
+        for ch in 0..3 {
+            sum[l][ch] += f64::from(uniques.colors[uniques.id[i] as usize][ch]) / 255.0;
+        }
+        sum[l][3] += 1.0;
+    }
+    let mut acc = 0.0_f64;
+    let mut n = 0.0_f64;
+    for &i in px {
+        let i = i as usize;
+        let l = lab[i] as usize;
+        if l >= 256 || sum[l][3] <= 0.0 {
+            continue;
+        }
+        let c = uniques.colors[uniques.id[i] as usize];
+        for ch in 0..3 {
+            let d = f64::from(c[ch]) / 255.0 - sum[l][ch] / sum[l][3];
+            acc += d * d;
+        }
+        n += 1.0;
+    }
+    (acc / (n * 3.0).max(1.0)).sqrt()
+}
+
+/// Adaptive acceptance bound for a fitted gradient model: meet the absolute
+/// smoothness floor outright, or beat the flat-band baseline by parity.
+fn gradient_bound(flat_pp: f64) -> f64 {
+    DELTA_ABS.max(flat_pp * FLAT_PARITY)
+}
+
+/// Maximum core-range overlap fraction between consecutive ranks of a
+/// gradient group along the fitted axis.
+///
+/// A genuine over-segmented ramp is a chain of *ordered* bands: each rank
+/// occupies a distinct segment of the projection axis (interquartile ranges
+/// barely overlap — only anti-aliasing straddles the boundaries). Texture
+/// shades of a painterly facet are the opposite: every rank's pixels spread
+/// across the whole projection range, so consecutive core ranges overlap
+/// almost completely. Ordering is what separates the two regimes — and only
+/// the first kind renders correctly as one gradient; the second renders its
+/// mixed bin means across whole sub-regions (the measured chest failure:
+/// ≈ 47 000 px ΔRGB 23–31 off the source).
+const RANK_OVERLAP_MAX: f64 = 0.6;
+
+/// Core (interquartile) overlap of two populations along a projection axis
+/// as a fraction of the shorter core range. Both slices are sorted in place.
+fn core_overlap(a: &mut [f64], b: &mut [f64]) -> f64 {
+    let quart = |v: &mut [f64]| -> (f64, f64) {
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let n = v.len();
+        if n == 0 {
+            return (0.0, 0.0);
+        }
+        (v[n / 4], v[(3 * n) / 4])
+    };
+    let (a_lo, a_hi) = quart(a);
+    let (b_lo, b_hi) = quart(b);
+    let overlap = (a_hi.min(b_hi) - a_lo.max(b_lo)).max(0.0);
+    let minlen = (a_hi - a_lo).min(b_hi - b_lo).max(1e-9);
+    overlap / minlen
+}
+
+/// Returns `true` when, along `proj_of`, no pair of the given per-rank
+/// projection samples has core overlap above [`RANK_OVERLAP_MAX`] with its
+/// median-neighbour. `projs` maps a rank id to its sample projections.
+fn ranks_ordered_along(proj_of: impl Fn(f64, f64) -> f64, uniques: &Uniques, px: &[u32], lab: &[u8]) -> bool {
+    let mut per_rank: std::collections::BTreeMap<u8, Vec<f64>> = std::collections::BTreeMap::new();
+    for &i in px {
+        let i = i as usize;
+        let t = proj_of((i % uniques.width) as f64, (i / uniques.width) as f64);
+        per_rank.entry(lab[i]).or_default().push(t);
+    }
+    // Ranks with too few samples carry no range information; skip them.
+    let mut ranges: Vec<(f64, Vec<f64>)> = per_rank
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 8)
+        .map(|(_, mut v)| {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            (v[v.len() / 2], v)
+        })
+        .collect();
+    ranges.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    for pair in ranges.windows(2) {
+        let mut a = pair[0].1.clone();
+        let mut b = pair[1].1.clone();
+        if core_overlap(&mut a, &mut b) > RANK_OVERLAP_MAX {
+            return false;
+        }
+    }
+    true
+}
+
+/// Per-pixel smoothness floor: a region may only become a gradient when the
+/// rendered gradient predicts every sampled pixel to within this RMS
+/// (roadmap M3 spec: "RMS residual < δ ≈ 2/255").
+const DELTA_ABS: f64 = 2.0 / 255.0;
+
+/// Residual of the *rendered* gradient over a sample: every pixel compared
+/// against the mean colour of its projection bin, where the projection is
+/// the gradient's own coordinate (axis position for linear, radius for
+/// radial). The emitted SVG gradient interpolates exactly this bin profile
+/// (`linear_def`/`radial_def` build their stops from the same bins), so this
+/// residual bounds the rendering error pixel-for-pixel.
+///
+/// Two properties make it the right gate. Against the global affine residual
+/// it adds freedom: a ramp whose colour profile is not a straight line in
+/// space (curved falloff, vignette) still fits — its bins are pure and each
+/// pixel sits on its bin mean. Against binned *means* it adds honesty: a
+/// spatially mixed union (a bright facet merged with darker shades sharing
+/// the same projection range) puts both populations into the same bins, so
+/// every pixel sits ≈ half the mix gap off the bin mean and the merge is
+/// rejected — the failure mode that painted a ≈ 47 000 px chest area
+/// ΔRGB 23–31 too dark on the mascot corpus.
+///
+/// Samples below `RESIDUAL_BINS * 4` cannot bin meaningfully; the caller's
+/// per-pixel affine residual is used instead.
+fn bin_profile_residual(
+    uniques: &Uniques,
+    px: &[u32],
+    proj_of: impl Fn(f64, f64) -> f64,
+    fallback: f64,
+) -> f64 {
+    let mut s = samples_of(uniques, px, uniques.width);
+    if s.len() < RESIDUAL_BINS * 4 {
+        return fallback;
+    }
+    let mut proj: Vec<(f64, [f64; 3])> = s
+        .iter_mut()
+        .map(|p| (proj_of(p.x, p.y), [f64::from(p.c[0]), f64::from(p.c[1]), f64::from(p.c[2])]))
+        .collect();
+    proj.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    let per = proj.len() / RESIDUAL_BINS;
+    let mut acc = 0.0_f64;
+    let mut n = 0.0_f64;
+    for bi in 0..RESIDUAL_BINS {
+        let seg = &mut proj[bi * per..(bi + 1) * per];
+        let mut mean = [0.0_f64; 3];
+        for (_, c) in seg.iter() {
+            for ch in 0..3 {
+                mean[ch] += c[ch];
+            }
+        }
+        for m in &mut mean {
+            *m /= per as f64;
+        }
+        for (_, c) in seg.iter() {
+            for ch in 0..3 {
+                let d = mean[ch] - c[ch];
+                acc += d * d;
+            }
+        }
+        n += per as f64;
+    }
+    (acc / (n * 3.0).max(1.0)).sqrt()
+}
+
+/// Residual of the best colour model for a candidate *pair merge*: affine,
+/// or — when enabled — radial, whichever is lower, evaluated on
+/// projection-binned mean colours.
+///
+/// The merge cascade is deliberately permissive: over-segmented shade chains
+/// carry per-pixel staircase floors of several 1/255 per band step (each
+/// band is a real flat step in the source), so a per-pixel bound here would
+/// split every shaded facet into flat bands — measurably *more* interior
+/// boundaries and *worse* edge error on the mascot corpus. Bin means align
+/// with the model for any ordered band chain, which is exactly what a merge
+/// candidate must be. Mixed-population groups (the failure this permissiveness
+/// admits) are rejected at the final gate by [`bin_profile_residual`], where
+/// the emitted gradient is judged against the pixels it renders.
+fn union_residual(uniques: &Uniques, px: &[u32], radial_enabled: bool) -> f64 {
+    let affine = fit_linear_sample(uniques, px)
+        .map_or(f64::MAX, |f| binned_linear_residual(&f, uniques, px));
+    if !radial_enabled {
+        return affine;
+    }
+    affine.min(
+        fit_radial(uniques, px)
+            .map_or(f64::MAX, |r| binned_radial_residual(&r, uniques, px)),
+    )
+}
+
+/// Residual of the affine model on projection-binned mean colours (merge
+/// cascade gate; see [`union_residual`]).
 fn binned_linear_residual(fit: &LinearFit, uniques: &Uniques, px: &[u32]) -> f64 {
     let w = uniques.width;
     let s = samples_of(uniques, px, w);
     if s.len() < RESIDUAL_BINS * 4 {
         return fit.rmse;
     }
-    let mut a = 0.0_f64;
-    let mut b = 0.0_f64;
-    let mut c = 0.0_f64;
-    for ch in 0..3 {
-        a += fit.gx[ch] * fit.gx[ch];
-        b += fit.gx[ch] * fit.gy[ch];
-        c += fit.gy[ch] * fit.gy[ch];
-    }
-    let axis = dominant_eigen2(a, b, c);
-    let mut proj: Vec<(f64, &Sample)> = s
-        .iter()
-        .map(|p| (axis[0] * p.x + axis[1] * p.y, p))
-        .collect();
+    let axis = linear_proj(fit);
+    let mut proj: Vec<(f64, &Sample)> =
+        s.iter().map(|p| (axis(p.x, p.y), p)).collect();
     proj.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-    let bins = RESIDUAL_BINS;
-    let per = proj.len() / bins;
+    let per = proj.len() / RESIDUAL_BINS;
     let mut acc = 0.0_f64;
     let mut n = 0.0_f64;
-    for bi in 0..bins {
+    for bi in 0..RESIDUAL_BINS {
         let seg = &proj[bi * per..(bi + 1) * per];
-        let mx = seg
-            .iter()
-            .map(|p| (p.1.x, 1.0))
-            .fold(0.0, |s, (v, _)| s + v)
-            / per as f64;
-        let my = seg
-            .iter()
-            .map(|p| (p.1.y, 1.0))
-            .fold(0.0, |s, (v, _)| s + v)
-            / per as f64;
+        let mx = seg.iter().map(|p| p.1.x).sum::<f64>() / per as f64;
+        let my = seg.iter().map(|p| p.1.y).sum::<f64>() / per as f64;
         for ch in 0..3 {
             let mc = seg.iter().map(|p| f64::from(p.1.c[ch])).sum::<f64>() / per as f64;
             let pred = fit.c0[ch] + fit.gx[ch] * mx + fit.gy[ch] * my;
@@ -542,28 +786,22 @@ fn binned_linear_residual(fit: &LinearFit, uniques: &Uniques, px: &[u32]) -> f64
     (acc / n.max(1.0)).sqrt()
 }
 
-/// Residual of the radial model on radius-binned mean colours (see
-/// [`binned_linear_residual`] for why binning is required).
+/// Residual of the radial model on radius-binned mean colours (merge
+/// cascade gate; see [`union_residual`]).
 fn binned_radial_residual(rf: &RadialFit, uniques: &Uniques, px: &[u32]) -> f64 {
     let w = uniques.width;
     let s = samples_of(uniques, px, w);
     if s.len() < RESIDUAL_BINS * 4 {
         return rf.rmse;
     }
-    let mut proj: Vec<(f64, &Sample)> = s
-        .iter()
-        .map(|p| {
-            let dx = p.x - rf.cx;
-            let dy = p.y - rf.cy;
-            (dx.hypot(dy), p)
-        })
-        .collect();
+    let radius = radial_proj(rf);
+    let mut proj: Vec<(f64, &Sample)> =
+        s.iter().map(|p| (radius(p.x, p.y), p)).collect();
     proj.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-    let bins = RESIDUAL_BINS;
-    let per = proj.len() / bins;
+    let per = proj.len() / RESIDUAL_BINS;
     let mut acc = 0.0_f64;
     let mut n = 0.0_f64;
-    for bi in 0..bins {
+    for bi in 0..RESIDUAL_BINS {
         let seg = &proj[bi * per..(bi + 1) * per];
         let mr = seg.iter().map(|p| p.0).sum::<f64>() / per as f64;
         for ch in 0..3 {
@@ -577,17 +815,25 @@ fn binned_radial_residual(rf: &RadialFit, uniques: &Uniques, px: &[u32]) -> f64 
     (acc / n.max(1.0)).sqrt()
 }
 
-/// Residual of the best colour model for a pixel set: affine, or — when
-/// enabled — radial, whichever is lower. Both are evaluated on binned means
-/// (quantisation-immune; see [`binned_linear_residual`]).
-fn union_residual(uniques: &Uniques, px: &[u32], radial_enabled: bool) -> f64 {
-    let affine = fit_linear_sample(uniques, px)
-        .map_or(f64::MAX, |f| binned_linear_residual(&f, uniques, px));
-    if !radial_enabled {
-        return affine;
+
+/// Gradient coordinate of the affine model: projection on the dominant axis.
+fn linear_proj(f: &LinearFit) -> impl Fn(f64, f64) -> f64 {
+    let mut a = 0.0_f64;
+    let mut b = 0.0_f64;
+    let mut c = 0.0_f64;
+    for ch in 0..3 {
+        a += f.gx[ch] * f.gx[ch];
+        b += f.gx[ch] * f.gy[ch];
+        c += f.gy[ch] * f.gy[ch];
     }
-    affine
-        .min(fit_radial(uniques, px).map_or(f64::MAX, |r| binned_radial_residual(&r, uniques, px)))
+    let axis = dominant_eigen2(a, b, c);
+    move |x, y| axis[0] * x + axis[1] * y
+}
+
+/// Gradient coordinate of the radial model: distance from the fitted centre.
+fn radial_proj(r: &RadialFit) -> impl Fn(f64, f64) -> f64 {
+    let (cx, cy) = (r.cx, r.cy);
+    move |x, y| (x - cx).hypot(y - cy)
 }
 
 const fn coords(i: u32, w: usize) -> (f64, f64) {
@@ -862,10 +1108,28 @@ fn linear_def(fit: &LinearFit, uniques: &Uniques, px: &[u32]) -> GradientDef {
     }
 }
 
+/// Per-pixel RMS residual of a fitted radial model over a sample. Used to
+/// compare candidate centres on the pixels they will actually render (the
+/// binned-mean comparison this replaces could prefer a centre whose bin
+/// means fit while its pixels do not).
+fn radial_pixel_rmse(rf: &RadialFit, s: &[Sample]) -> f64 {
+    if s.is_empty() {
+        return f64::MAX;
+    }
+    let mut acc = 0.0_f64;
+    for p in s {
+        let r = (p.x - rf.cx).hypot(p.y - rf.cy);
+        for ch in 0..3 {
+            let res = rf.c0[ch] + rf.g[ch] * r - f64::from(p.c[ch]);
+            acc += res * res;
+        }
+    }
+    (acc / (s.len() as f64 * 3.0)).sqrt()
+}
+
 /// Gauss–Newton fit of a radial ramp: colour ≈ c0 + g·r around a fitted
 /// centre. Returns the centre, radius span and residual.
-fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
-    let w = uniques.width;
+fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {    let w = uniques.width;
     let s = samples_of(uniques, px, w);
     if s.len() < 12 {
         return None;
@@ -933,10 +1197,9 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
     }
     // The Gauss–Newton walk drifts on a quantised staircase (each ring is a
     // flat colour step, so the centre is weakly determined); a few px of
-    // centre error inflates the *binned* residual that the merge gates use.
-    // Evaluate the plain centroid as well — for (near-)complete rings the
-    // centroid *is* the centre — and keep whichever explains the binned
-    // means better.
+    // centre error inflates the residual the merge gates use. Evaluate the
+    // plain centroid as well — for (near-)complete rings the centroid *is*
+    // the centre — and keep whichever explains the sampled pixels better.
     let (mut best_c, mut best_cg) = (best_c, best_cg);
     let (ccx, ccy) = (
         s.iter().map(|p| p.x).sum::<f64>() / s.len() as f64,
@@ -967,19 +1230,14 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
                 g,
                 rmse: best,
             };
-            if binned_radial_residual(&cand, uniques, px)
-                < binned_radial_residual(
-                    &RadialFit {
-                        cx: best_c.0,
-                        cy: best_c.1,
-                        r: best_span,
-                        c0: best_cg.0,
-                        g: best_cg.1,
-                        rmse: best,
-                    },
-                    uniques,
-                    px,
-                )
+            if radial_pixel_rmse(&cand, &s) < radial_pixel_rmse(&RadialFit {
+                cx: best_c.0,
+                cy: best_c.1,
+                r: best_span,
+                c0: best_cg.0,
+                g: best_cg.1,
+                rmse: best,
+            }, &s)
             {
                 best_c = (ccx, ccy);
                 best_cg = (c0, g);
@@ -1238,11 +1496,13 @@ mod tests {
             radial.cx,
             radial.cy
         );
-        // And the binned residual must be far below the merge threshold.
-        let binned = binned_radial_residual(&radial, &uniques, &px_sample);
+        // And the per-pixel residual must be far below the merge threshold:
+        // the 32-step quantisation puts ≈ step/√12 ≈ 1.8/255 on every pixel,
+        // which the flat-band parity floor absorbs (see [`gradient_bound`]).
         assert!(
-            binned < 2.0 / 255.0,
-            "binned radial residual under delta: {binned:.5}"
+            radial.rmse < 2.0 / 255.0,
+            "per-pixel radial residual under delta: {:.5}",
+            radial.rmse
         );
     }
     #[test]
@@ -1301,4 +1561,49 @@ mod tests {
         let regions = flat_regions(3, &[10, 500, 100]);
         assert_eq!(regions.paint_ranks(), vec![2, 0, 1]);
     }
+
+    /// The final group fit must sample the region's real population: a
+    /// 90/10 rank split sampled per-rank-balanced would tilt the fit toward
+    /// the minority (the measured chest-darkening bug); the population
+    /// sample keeps the 90/10 shares.
+    #[test]
+    fn population_sample_keeps_population_shares() {
+        let big: Vec<u32> = (0..9000).collect();
+        let small: Vec<u32> = (9000..10_000).collect();
+        let rank_pixels = vec![big, small];
+        let s = population_sample(&rank_pixels, &[0, 1], 1000);
+        let from_big = s.iter().filter(|&&p| p < 9000).count();
+        assert_eq!(s.len(), 1000);
+        let share = f64::from(from_big as u32) / 1000.0;
+        assert!(
+            (share - 0.9).abs() < 0.05,
+            "big rank share {share} must stay ≈ 0.9"
+        );
+        // Small inputs are returned verbatim (no artificial cap).
+        let s2 = population_sample(&rank_pixels, &[1], 8192);
+        assert_eq!(s2.len(), 1000);
+    }
+
+    /// The final group fit must sample the region's real population: a
+    /// 90/10 rank split sampled per-rank-balanced would tilt the fit toward
+    /// the minority (the measured chest-darkening bug); the population
+    /// sample keeps the 90/10 shares.
+    #[test]
+    fn population_sample_keeps_population_shares() {
+        let big: Vec<u32> = (0..9000).collect();
+        let small: Vec<u32> = (9000..10_000).collect();
+        let rank_pixels = vec![big, small];
+        let s = population_sample(&rank_pixels, &[0, 1], 1000);
+        let from_big = s.iter().filter(|&&p| p < 9000).count();
+        assert_eq!(s.len(), 1000);
+        let share = f64::from(from_big as u32) / 1000.0;
+        assert!(
+            (share - 0.9).abs() < 0.05,
+            "big rank share {share} must stay ≈ 0.9"
+        );
+        // Small inputs are returned verbatim (no artificial cap).
+        let s2 = population_sample(&rank_pixels, &[1], 8192);
+        assert_eq!(s2.len(), 1000);
+    }
+
 }

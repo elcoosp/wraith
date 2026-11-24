@@ -57,6 +57,7 @@ struct PxLater {
     lo: u32,
     hi: u32,
     whi: f32,
+    wlo: f32,
     alpha: f32,
 }
 
@@ -268,12 +269,18 @@ pub(crate) fn build_layers(
                 i,
             );
         }
-        let (lo, hi, whi) = match ra.cmp(&rb) {
-            std::cmp::Ordering::Less => (ra as u32, rb as u32, eff_wb),
-            std::cmp::Ordering::Greater => (rb as u32, ra as u32, eff_wa),
-            std::cmp::Ordering::Equal => (ra as u32, ra as u32, 0.0),
+        let (lo, hi, whi, wlo) = match ra.cmp(&rb) {
+            std::cmp::Ordering::Less => (ra as u32, rb as u32, eff_wb, eff_wa),
+            std::cmp::Ordering::Greater => (rb as u32, ra as u32, eff_wa, eff_wb),
+            std::cmp::Ordering::Equal => (ra as u32, ra as u32, 0.0, eff_wa),
         };
-        px_later[i] = PxLater { lo, hi, whi, alpha };
+        px_later[i] = PxLater {
+            lo,
+            hi,
+            whi,
+            wlo,
+            alpha,
+        };
 
         let (x, y) = (i % w, i / w);
         for r in [ra, rb] {
@@ -287,6 +294,8 @@ pub(crate) fn build_layers(
             b.3 = b.3.max(y + 1);
         }
     }
+
+    prune_floating_coverage(&mut accs, &px_later, w, h);
 
     let trap_r = settings.trap_radius();
     let tol = f64::from(settings.tolerance_px);
@@ -373,6 +382,47 @@ pub(crate) fn build_layers(
         );
     }
     layers
+}
+
+/// Coverage weight below which a pixel is a *floating-scrap* candidate. A
+/// real 1-px feature still holds at least this much coverage at its core
+/// (a centred 1-px line lands at ≥ 0.5), while mixture misassignments at
+/// 3-way junctions produce isolated scraps well below it.
+const FLOATING_MIN_W: f32 = 0.45;
+
+/// Drops isolated low-coverage scraps from every rank's coverage list.
+///
+/// At 3-way junctions (ink stroke meeting two fills) the local-mixture
+/// decomposition can assign a stray partial weight to an unrelated rank a
+/// pixel or two beyond its region. Each stray weight becomes a 1–2 px
+/// floating coverage island, which marching squares turns into a closed
+/// sliver ring — the measured source of the black specks at junctions and of
+/// 100–150 degenerate micro-`<ellipse>` primitives per mascot image. A scrap
+/// survives only when a same-rank neighbour within a 5×5 window carries a
+/// solid (≥ [`FLOATING_MIN_W`]) weight, which real anti-aliased features
+/// always have and artifacts never do.
+fn prune_floating_coverage(accs: &mut [UnitAcc], px_later: &[PxLater], w: usize, h: usize) {
+    for (rank, acc) in accs.iter_mut().enumerate() {
+        let rank = rank as u32;
+        acc.cov.retain(|&(px, weight)| {
+            if weight >= FLOATING_MIN_W {
+                return true;
+            }
+            let i = px as usize;
+            let (x, y) = (i % w, i / w);
+            for yy in y.saturating_sub(2)..(y + 3).min(h) {
+                for xx in x.saturating_sub(2)..(x + 3).min(w) {
+                    let pl = &px_later[yy * w + xx];
+                    let anchored = (pl.lo == rank && pl.wlo >= FLOATING_MIN_W)
+                        || (pl.hi == rank && pl.whi >= FLOATING_MIN_W);
+                    if anchored {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+    }
 }
 
 /// Max squared sRGB residual of a decomposition accepted for band collection
@@ -577,6 +627,13 @@ fn build_edge_band_layers(
             let (x, y) = (i as usize % w, i as usize / w);
             field[(y - y0 + 1) * spw + (x - x0 + 1)] = t;
         }
+        // The width/area gate measures the *raw* mixture field: the binomial
+        // blur below smears t sideways, inflating the strip and hiding real
+        // ramps — measured on the mascot corpus, a 2-px silhouette ramp read
+        // ≈ 1.4 px blurred but ≈ 1.05 px raw, enough to fall under the gate.
+        // Band *geometry* is still traced from the blurred field (smoother
+        // rings, better fits).
+        let raw = field.clone();
         blur_field(&mut field, spw, sph, blur);
         let span = [TileSpan {
             x0: 0,
@@ -605,18 +662,22 @@ fn build_edge_band_layers(
         };
         let outer = trace_iso(&field, 0.25, &mut nxt);
         let inner = trace_iso(&field, 0.75, &mut nxt);
-        let strip_area = outer
+        // Gate measurement on the raw field (see above); the blurred rings
+        // remain the emitted geometry.
+        let raw_outer = trace_iso(&raw, 0.25, &mut nxt);
+        let raw_inner = trace_iso(&raw, 0.75, &mut nxt);
+        let strip_area = raw_outer
             .iter()
             .map(|r| fit::area(&dedupe_ring(r)).abs())
             .sum::<f64>()
-            - inner
+            - raw_inner
                 .iter()
                 .map(|r| fit::area(&dedupe_ring(r)).abs())
                 .sum::<f64>();
         // Width from the strip's outer boundary only: the nested iso-0.75
         // sliver ring roughly doubles the perimeter and would halve the
         // measured width of every band.
-        let outer_perim = outer
+        let outer_perim = raw_outer
             .iter()
             .map(|r| ring_perim(&dedupe_ring(r)))
             .sum::<f64>();
@@ -1300,6 +1361,13 @@ fn trace_rank_field(
     });
     let fitted = fit::fit_rings_parallel(&full, tol, corner_rad, smooth);
     let use_prim = use_primitives && !has_hole_rings(&full);
+    // A primitive claim is a *standalone shape* claim: the total ring area of
+    // the layer gates whether any single ring may be rewritten (see
+    // `primitives::detect_ring`).
+    let layer_area = full
+        .iter()
+        .map(|r| fit::area(&dedupe_ring(r)).abs())
+        .sum::<f64>();
     let mut shapes = std::vec::Vec::new();
     let mut path_segs: Vec<(P, Vec<PathSeg>)> = Vec::new();
     for (ri, (start, segs)) in fitted.iter().enumerate() {
@@ -1322,7 +1390,8 @@ fn trace_rank_field(
         }
         if use_prim {
             let segs_arc = primitives::arcs_for_ring(*start, &segs, tol);
-            if let Some(shape) = primitives::detect_ring(&dense, *start, &segs_arc, tol) {
+            if let Some(shape) = primitives::detect_ring(&dense, *start, &segs_arc, tol, layer_area)
+            {
                 shapes.push(shape);
                 continue;
             }

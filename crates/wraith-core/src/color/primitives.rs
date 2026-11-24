@@ -12,10 +12,33 @@
 
 use crate::color::Shape;
 use crate::color::contour::P;
-use crate::color::fit::Seg;
+use crate::color::fit::{self, Seg};
 
 /// Maximum allowed conic-fit deviation for primitive acceptance.
 const PRIMITIVE_TOL: f64 = 0.25;
+
+/// Minimum ring area (px²) before a circle/ellipse hypothesis is even
+/// considered. Primitive detection targets *designed* full shapes; anything
+/// smaller is speck-scale geometry (leak slivers at 3-way junctions render as
+/// 5–15 px² rings) that must stay a path — measured on the mascot corpus,
+/// 100 % of false-positive ellipses sat below this floor while real circles
+/// (fixtures, icons) sit two orders of magnitude above it.
+const PRIMITIVE_MIN_AREA: f64 = 40.0;
+
+/// Minimum semi-axis (px) of an accepted circle/ellipse.
+const PRIMITIVE_MIN_RADIUS: f64 = 2.5;
+
+/// Maximum axis ratio of an accepted ellipse. Degenerate sliver rings
+/// (a 17×1 px leak contour) fit "ellipses" with ratio ≈ 17: real designed
+/// ellipses in graphic art stay far below this.
+const PRIMITIVE_MAX_ASPECT: f64 = 6.0;
+
+/// Fraction of the layer's own coverage a ring must enclose to be considered
+/// for primitive detection. Primitives are a *standalone shape* claim: a ring
+/// that is one component among many (specks, trapped slivers, holes) is not
+/// the layer's geometry, and rewriting it silently repaints what lies under
+/// it with the layer's fill.
+const PRIMITIVE_MIN_DOMINANCE: f64 = 0.9;
 
 /// Circumcircle through three well-separated points: the exact circle
 /// through `a`, `b`, `c`, or `None` when they are (near-)collinear. Unlike an
@@ -109,20 +132,37 @@ fn ellipse_dev(pts: &[P], cx: f64, cy: f64, rx: f64, ry: f64, theta_deg: f64) ->
 /// Detects a standalone primitive for a single-ring layer, ring-aware:
 /// `start` is the ring's start point preceding `segs`. Ellipse/circle first
 /// (needs zero straight pieces), then axis-aligned rounded rect.
+///
+/// `layer_area` is the total absolute ring area of the owning layer; the
+/// candidate ring must enclose at least [`PRIMITIVE_MIN_DOMINANCE`] of it
+/// before any primitive is accepted, so fragments and slivers of multi-ring
+/// layers can never be promoted to filled shapes.
 #[must_use]
-pub fn detect_ring(dense: &[P], start: P, segs: &[Seg], tol: f64) -> Option<Shape> {
+pub fn detect_ring(dense: &[P], start: P, segs: &[Seg], tol: f64, layer_area: f64) -> Option<Shape> {
     let prim_tol = PRIMITIVE_TOL.max(tol * 0.8);
     let has_lines = segs.iter().any(|s| matches!(s, Seg::Line(..)));
     if !has_lines {
-        if let Some((cx, cy, rx, ry, theta)) = ellipse_fit(dense) {
-            if (rx - ry).abs() <= 0.02 * rx.max(ry) {
-                let r = f64::midpoint(rx, ry);
-                if ellipse_dev(dense, cx, cy, r, r, 0.0) < prim_tol {
-                    return Some(Shape::Circle { cx, cy, r });
+        let ring_area = fit::area(dense).abs();
+        let dominant = ring_area >= PRIMITIVE_MIN_DOMINANCE * layer_area.max(1.0);
+        if dominant && ring_area >= PRIMITIVE_MIN_AREA {
+            if let Some((cx, cy, rx, ry, theta)) = ellipse_fit(dense) {
+                // Reject degenerate sliver fits up front: an ellipse whose
+                // axes are a few px long or wildly unequal is a contour leak,
+                // not a designed shape.
+                if rx >= PRIMITIVE_MIN_RADIUS
+                    && ry >= PRIMITIVE_MIN_RADIUS
+                    && rx / ry <= PRIMITIVE_MAX_ASPECT
+                {
+                    if (rx - ry).abs() <= 0.02 * rx.max(ry) {
+                        let r = f64::midpoint(rx, ry);
+                        if ellipse_dev(dense, cx, cy, r, r, 0.0) < prim_tol {
+                            return Some(Shape::Circle { cx, cy, r });
+                        }
+                    }
+                    if ellipse_dev(dense, cx, cy, rx, ry, theta) < prim_tol {
+                        return Some(Shape::Ellipse { cx, cy, rx, ry });
+                    }
                 }
-            }
-            if ellipse_dev(dense, cx, cy, rx, ry, theta) < prim_tol {
-                return Some(Shape::Ellipse { cx, cy, rx, ry });
             }
         }
         return None;
@@ -322,7 +362,8 @@ mod tests {
             Seg::Cubic([60.0, 35.0], [85.0, 35.0], [85.0, 60.0]),
             Seg::Cubic([85.0, 85.0], [60.0, 85.0], [60.0, 60.0]),
         ];
-        let shape = detect_ring(&ring, ring[0], &segs, 0.3);
+        let layer_area = fit::area(&ring).abs();
+        let shape = detect_ring(&ring, ring[0], &segs, 0.3, layer_area);
         assert!(matches!(shape, Some(Shape::Circle { .. })), "got {shape:?}");
     }
 
@@ -338,7 +379,8 @@ mod tests {
             Seg::Cubic([100.0, 28.0], [100.0, 52.0], [60.0, 52.0]),
             Seg::Cubic([20.0, 52.0], [20.0, 28.0], [60.0, 28.0]),
         ];
-        let shape = detect_ring(&ring, ring[0], &segs, 0.3);
+        let layer_area = fit::area(&ring).abs();
+        let shape = detect_ring(&ring, ring[0], &segs, 0.3, layer_area);
         assert!(
             matches!(shape, Some(Shape::Ellipse { .. })),
             "got {shape:?}"
@@ -371,6 +413,54 @@ mod tests {
         let wiggle = vec![Seg::Cubic([110.0, 30.0], [90.0, 70.0], [150.0, 100.0])];
         let out2 = arcs_for_ring(start, &wiggle, 0.3);
         assert!(matches!(out2[0], Seg::Cubic(..)));
+    }
+
+    /// A degenerate sliver ring — the leak-contour signature measured on the
+    /// mascot corpus (100–150 tiny `<ellipse>` fills per image before the
+    /// gate, every one of them a junction leak, every one measurably wrong) —
+    /// must never be promoted to a filled primitive: it is below the area
+    /// floor, below the minimum radius, above the aspect bound, and it is a
+    /// fragment of a multi-component layer rather than a standalone shape.
+    #[test]
+    fn detect_ring_rejects_micro_sliver_ellipses() {
+        // A 17×1 px sliver: the exact shape of the worst offender in the
+        // baseline (`rx=8.66 ry=.5`).
+        let ring: Vec<P> = (0..64)
+            .map(|i| {
+                let t = std::f64::consts::TAU * f64::from(i) / 64.0;
+                [180.0 + 8.66 * t.cos(), 647.5 + 0.5 * t.sin()]
+            })
+            .collect();
+        let segs = vec![
+            Seg::Cubic([188.0, 647.0], [188.0, 648.0], [180.0, 648.0]),
+            Seg::Cubic([172.0, 648.0], [172.0, 647.0], [180.0, 647.0]),
+        ];
+        // As its own tiny layer (dominant but below the area floor)...
+        assert!(detect_ring(&ring, ring[0], &segs, 0.3, fit::area(&ring).abs()).is_none());
+        // ...and as a fragment of a large layer (a big sibling exists).
+        assert!(detect_ring(&ring, ring[0], &segs, 0.3, 5_000.0).is_none());
+        // A 4:1 ellipse of real size is still accepted when standalone.
+        let big: Vec<P> = (0..256)
+            .map(|i| {
+                let t = std::f64::consts::TAU * f64::from(i) / 256.0;
+                [100.0 + 40.0 * t.cos(), 60.0 + 10.0 * t.sin()]
+            })
+            .collect();
+        let big_segs = vec![
+            Seg::Cubic([140.0, 50.0], [140.0, 70.0], [100.0, 70.0]),
+            Seg::Cubic([60.0, 70.0], [60.0, 50.0], [100.0, 50.0]),
+        ];
+        let layer_area = fit::area(&big).abs();
+        assert!(
+            matches!(
+                detect_ring(&big, big[0], &big_segs, 0.3, layer_area),
+                Some(Shape::Ellipse { .. })
+            ),
+            "real ellipse must survive the gates"
+        );
+        // ...but the same ellipse as a fragment (layer has a big sibling)
+        // must be rejected: not a standalone shape.
+        assert!(detect_ring(&big, big[0], &big_segs, 0.3, layer_area * 3.0).is_none());
     }
 
     #[test]
