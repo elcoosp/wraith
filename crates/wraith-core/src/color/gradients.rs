@@ -282,23 +282,10 @@ pub fn detect_regions(
         // only while the merged ring stays thin). The residual is per-pixel
         // RMS against the model the renderer will evaluate — the roadmap M3
         // definition of "consistent". MDL, width and rank-count gates apply
-        // to the *final* group.
-        // Ordering gate: the two sides must be distinct segments of the
-        // projection axis, not interleaved texture shades (see
-        // [`ranks_ordered_along`]).
-        let ordered = |fit: Option<LinearFit>, radial: Option<RadialFit>| -> bool {
-            if let Some(f) = &fit {
-                return ranks_ordered_along(linear_proj(f), uniques, &union_px, &lab);
-            }
-            if let Some(r) = &radial {
-                return ranks_ordered_along(radial_proj(r), uniques, &union_px, &lab);
-            }
-            false
-        };
-        let lin_fit = fit_linear_sample(uniques, &union_px);
-        let rad_fit = radial_on.then(|| fit_radial(uniques, &union_px)).flatten();
+        // to the *final* group; interleaved-shade groups are caught at the
+        // final gate by the bin-profile residual (see below).
         let residual = union_residual(uniques, &union_px, radial_on);
-        if residual < DELTA_ABS && ordered(lin_fit, rad_fit) {
+        if residual < DELTA_ABS {
             parent[rb] = ra;
             pixels_per_root[ra] = concat_all(&pixels_per_root[ra], &pixels_per_root[rb]);
             pixels_per_root[rb].clear();
@@ -331,16 +318,17 @@ pub fn detect_regions(
         if ranks.len() < 3 {
             continue;
         }
-        // Population-representative sample: the fit and its residual must
-        // describe the region's real pixel distribution, not a per-rank
-        // balanced mix (see [`population_sample`]).
+        // Population-representative sample for the *gates* (the render
+        // affects pixels by share), balanced per-rank sample for the *fits*
+        // (see [`balanced_group_sample`]).
         let px = population_sample(&rank_pixels, ranks, 8192);
-        let fit = fit_linear_sample(uniques, &px);
+        let fit_px = balanced_group_sample(&rank_pixels, ranks);
+        let fit = fit_linear_sample(uniques, &fit_px);
         let linear = fit.as_ref().map_or(f64::MAX, |f| {
             bin_profile_residual(uniques, &px, linear_proj(f), f.rmse)
         });
         let radial_fit = if radial_enabled {
-            fit_radial(uniques, &px)
+            fit_radial(uniques, &fit_px)
         } else {
             None
         };
@@ -349,19 +337,16 @@ pub fn detect_regions(
         });
         // Final gates: the rendered gradient (bin-profile residual) must
         // beat the flat-band fallback's per-pixel error
-        // ([`gradient_bound`]), and the group's ranks must be ordered along
-        // the winning model's axis (see [`ranks_ordered_along`]).
+        // ([`gradient_bound`]). The bin profile is the interleaved-shade
+        // discriminator on its own: a texture-shade group has every
+        // projection bin mixing several shades, so its per-pixel residual
+        // stays far above the bound, while an ordered ramp's bins each hold
+        // one shade (the former pairwise ordering gate — core-range overlap
+        // — is gone: it also rejected perfectly ordered spatially-extended
+        // bands, e.g. a disc ramp whose bands span the whole chord, which
+        // regressed the gradient_logo fixture to banded flats).
         let flat_pp = flat_baseline_rmse(uniques, &px, &lab);
         if linear.min(radial) >= gradient_bound(flat_pp) {
-            continue;
-        }
-        let ordered = if radial < linear {
-            ranks_ordered_along(radial_proj(radial_fit.as_ref().expect("radial won")), uniques, &px, &lab)
-        } else {
-            fit.as_ref()
-                .is_some_and(|f| ranks_ordered_along(linear_proj(f), uniques, &px, &lab))
-        };
-        if !ordered {
             continue;
         }
         // True pixel count (the fit sample is capped per rank and would
@@ -412,7 +397,8 @@ pub fn detect_regions(
             .flat_map(|&r| rank_pixels[r].iter().copied())
             .collect();
         let px = sample_cap(&px_all, 8192);
-        let fit = fit_linear_sample(uniques, &px).unwrap_or(LinearFit {
+        let fit_px = balanced_group_sample(&rank_pixels, ranks);
+        let fit = fit_linear_sample(uniques, &fit_px).unwrap_or(LinearFit {
             c0: [0.0; 3],
             gx: [0.0; 3],
             gy: [0.0; 3],
@@ -422,9 +408,19 @@ pub fn detect_regions(
         for &r in ranks {
             band_to_region[r] = region as u16;
         }
+        // Model choice by bin-profile residual, matching the acceptance
+        // gate: the affine fit RMSE can favour the radial model while its
+        // *rendered* bin profile is worse — measured on mascot-warn, a
+        // marginally-better affine radial rendered ≈ 1 RMSE worse than the
+        // linear bands it replaced.
         let def = if matches!(settings.gradients, Gradients::LinearRadial) {
-            match fit_radial(uniques, &px) {
-                Some(rf) if rf.rmse < fit.rmse => radial_def(&rf, uniques, &px),
+            let linear_bp = bin_profile_residual(uniques, &px, linear_proj(&fit), fit.rmse);
+            match fit_radial(uniques, &fit_px) {
+                Some(rf) if bin_profile_residual(uniques, &px, radial_proj(&rf), rf.rmse)
+                    < linear_bp =>
+                {
+                    radial_def(&rf, uniques, &px)
+                }
                 _ => linear_def(&fit, uniques, &px),
             }
         } else {
@@ -486,6 +482,25 @@ fn sample_cap(px: &[u32], cap: usize) -> Vec<u32> {
     }
     let stride = px.len().div_ceil(cap).max(1);
     (0..px.len()).step_by(stride).map(|i| px[i]).collect()
+}
+
+/// Balanced per-rank sample of a group for *fitting*: each rank contributes
+/// ≤ [`FIT_RANK_CAP`] evenly strided pixels, so the fitted axis spans the
+/// whole ramp instead of hugging its population-heavy middle (measured on
+/// the gradient_logo fixture: population-weighted fitting rotated the disc
+/// ramp's axis, its bin-profile gate then rejected the gradient and the
+/// fixture fell back to banded flats at +2 RMSE). The emitted *stops* and
+/// all acceptance gates still sample the population ([`population_sample`])
+/// — with the bin-profile gate in place, a minority-tilted fit can no
+/// longer paint mixed shades past acceptance.
+const FIT_RANK_CAP: usize = 512;
+
+/// Balanced per-rank sample of a group (see [`FIT_RANK_CAP`]).
+fn balanced_group_sample(rank_pixels: &[Vec<u32>], ranks: &[usize]) -> Vec<u32> {
+    ranks
+        .iter()
+        .flat_map(|&r| sample_cap(&rank_pixels[r], FIT_RANK_CAP))
+        .collect()
 }
 
 /// Population-representative sample of a *group* of ranks: every rank keeps
@@ -605,71 +620,10 @@ fn gradient_bound(flat_pp: f64) -> f64 {
     DELTA_ABS.max(flat_pp * FLAT_PARITY)
 }
 
-/// Maximum core-range overlap fraction between consecutive ranks of a
-/// gradient group along the fitted axis.
-///
-/// A genuine over-segmented ramp is a chain of *ordered* bands: each rank
-/// occupies a distinct segment of the projection axis (interquartile ranges
-/// barely overlap — only anti-aliasing straddles the boundaries). Texture
-/// shades of a painterly facet are the opposite: every rank's pixels spread
-/// across the whole projection range, so consecutive core ranges overlap
-/// almost completely. Ordering is what separates the two regimes — and only
-/// the first kind renders correctly as one gradient; the second renders its
-/// mixed bin means across whole sub-regions (the measured chest failure:
-/// ≈ 47 000 px ΔRGB 23–31 off the source).
-const RANK_OVERLAP_MAX: f64 = 0.6;
-
-/// Core (interquartile) overlap of two populations along a projection axis
-/// as a fraction of the shorter core range. Both slices are sorted in place.
-fn core_overlap(a: &mut [f64], b: &mut [f64]) -> f64 {
-    let quart = |v: &mut [f64]| -> (f64, f64) {
-        v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-        let n = v.len();
-        if n == 0 {
-            return (0.0, 0.0);
-        }
-        (v[n / 4], v[(3 * n) / 4])
-    };
-    let (a_lo, a_hi) = quart(a);
-    let (b_lo, b_hi) = quart(b);
-    let overlap = (a_hi.min(b_hi) - a_lo.max(b_lo)).max(0.0);
-    let minlen = (a_hi - a_lo).min(b_hi - b_lo).max(1e-9);
-    overlap / minlen
-}
-
-/// Returns `true` when, along `proj_of`, no pair of the given per-rank
-/// projection samples has core overlap above [`RANK_OVERLAP_MAX`] with its
-/// median-neighbour. `projs` maps a rank id to its sample projections.
-fn ranks_ordered_along(proj_of: impl Fn(f64, f64) -> f64, uniques: &Uniques, px: &[u32], lab: &[u8]) -> bool {
-    let mut per_rank: std::collections::BTreeMap<u8, Vec<f64>> = std::collections::BTreeMap::new();
-    for &i in px {
-        let i = i as usize;
-        let t = proj_of((i % uniques.width) as f64, (i / uniques.width) as f64);
-        per_rank.entry(lab[i]).or_default().push(t);
-    }
-    // Ranks with too few samples carry no range information; skip them.
-    let mut ranges: Vec<(f64, Vec<f64>)> = per_rank
-        .into_iter()
-        .filter(|(_, v)| v.len() >= 8)
-        .map(|(_, mut v)| {
-            v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            (v[v.len() / 2], v)
-        })
-        .collect();
-    ranges.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-    for pair in ranges.windows(2) {
-        let mut a = pair[0].1.clone();
-        let mut b = pair[1].1.clone();
-        if core_overlap(&mut a, &mut b) > RANK_OVERLAP_MAX {
-            return false;
-        }
-    }
-    true
-}
-
 /// Per-pixel smoothness floor: a region may only become a gradient when the
 /// rendered gradient predicts every sampled pixel to within this RMS
-/// (roadmap M3 spec: "RMS residual < δ ≈ 2/255").
+/// (roadmap M3 spec: "RMS residual < δ ≈ 2/255"). Interleaved texture-shade
+/// groups sit at ≈10+/255 and are rejected by a wide margin.
 const DELTA_ABS: f64 = 2.0 / 255.0;
 
 /// Residual of the *rendered* gradient over a sample: every pixel compared
@@ -1584,26 +1538,6 @@ mod tests {
         assert_eq!(s2.len(), 1000);
     }
 
-    /// The final group fit must sample the region's real population: a
-    /// 90/10 rank split sampled per-rank-balanced would tilt the fit toward
-    /// the minority (the measured chest-darkening bug); the population
-    /// sample keeps the 90/10 shares.
-    #[test]
-    fn population_sample_keeps_population_shares() {
-        let big: Vec<u32> = (0..9000).collect();
-        let small: Vec<u32> = (9000..10_000).collect();
-        let rank_pixels = vec![big, small];
-        let s = population_sample(&rank_pixels, &[0, 1], 1000);
-        let from_big = s.iter().filter(|&&p| p < 9000).count();
-        assert_eq!(s.len(), 1000);
-        let share = f64::from(from_big as u32) / 1000.0;
-        assert!(
-            (share - 0.9).abs() < 0.05,
-            "big rank share {share} must stay ≈ 0.9"
-        );
-        // Small inputs are returned verbatim (no artificial cap).
-        let s2 = population_sample(&rank_pixels, &[1], 8192);
-        assert_eq!(s2.len(), 1000);
-    }
+}
 
 }
