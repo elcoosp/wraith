@@ -315,7 +315,6 @@ fn bilateral_denoise_rgba(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     cur
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::settings::{Background, ColorSettings};

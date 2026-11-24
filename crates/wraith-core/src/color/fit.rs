@@ -511,8 +511,7 @@ fn bow(pts: &[P], c: P, d: P) -> f64 {
     let a = [[m, s1, s2], [s1, s2, s3], [s2, s3, s4]];
     let det3 = |mat: [[f64; 3]; 3]| {
         let [[m00, m01, m02], [m10, m11, m12], [m20, m21, m22]] = mat;
-        m00 * (m11 * m22 - m12 * m21)
-            - m01 * (m10 * m22 - m12 * m20)
+        m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20)
             + m02 * (m10 * m21 - m11 * m20)
     };
     let dd = det3(a);
@@ -631,13 +630,19 @@ pub(crate) fn fit_ring_ex(
     // lines become the lines' intersection.
     let lines: Vec<Option<(P, P)>> = pieces
         .iter()
-        .enumerate().map(|(ci, pc)| {
+        .enumerate()
+        .map(|(ci, pc)| {
             if smooth_cut || pc.len() < 4 {
                 return None;
             }
             let (c, d, dev) = tls_line(pc);
             let chord = len(sub(pc[pc.len() - 1], pc[0]));
-            let lim = if run_start[cuts[ci]] { line_tol.max(tol) } else { tol }; (chord >= 4.0 && dev < lim).then_some((c, d))
+            let lim = if run_start[cuts[ci]] {
+                line_tol.max(tol)
+            } else {
+                tol
+            };
+            (chord >= 4.0 && dev < lim).then_some((c, d))
         })
         .collect();
     let mut cpos: Vec<P> = cuts.iter().map(|&i| ring[i]).collect();

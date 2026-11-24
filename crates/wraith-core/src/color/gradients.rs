@@ -877,10 +877,7 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
     let mut best_span = 0.0_f64;
     let mut best_cg = ([0.0_f64; 3], [0.0_f64; 3]);
     for _ in 0..6 {
-        let radii: Vec<f64> = s
-            .iter()
-            .map(|p| (p.x - cx).hypot(p.y - cy))
-            .collect();
+        let radii: Vec<f64> = s.iter().map(|p| (p.x - cx).hypot(p.y - cy)).collect();
         let rmean = radii.iter().sum::<f64>() / radii.len() as f64;
         let srr: f64 = radii.iter().map(|r| (r - rmean) * (r - rmean)).sum();
         let var_r = srr / radii.len() as f64;
@@ -946,10 +943,7 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
         s.iter().map(|p| p.y).sum::<f64>() / s.len() as f64,
     );
     if (ccx - best_c.0).abs() > 0.5 || (ccy - best_c.1).abs() > 0.5 {
-        let radii: Vec<f64> = s
-            .iter()
-            .map(|p| (p.x - ccx).hypot(p.y - ccy))
-            .collect();
+        let radii: Vec<f64> = s.iter().map(|p| (p.x - ccx).hypot(p.y - ccy)).collect();
         let rmean = radii.iter().sum::<f64>() / radii.len() as f64;
         let srr: f64 = radii.iter().map(|r| (r - rmean) * (r - rmean)).sum();
         if srr > 1e-9 {
@@ -1017,8 +1011,7 @@ fn fit_radial(uniques: &Uniques, px: &[u32]) -> Option<RadialFit> {
 fn radial_def(rf: &RadialFit, uniques: &Uniques, px: &[u32]) -> GradientDef {
     let w = uniques.width;
     let s = samples_of(uniques, px, w);
-    let radius =
-        |p: &Sample| (p.x - rf.cx).hypot(p.y - rf.cy);
+    let radius = |p: &Sample| (p.x - rf.cx).hypot(p.y - rf.cy);
     let nb = 24_usize;
     let (mut lo, mut hi) = (f64::MAX, f64::MIN);
     for p in &s {
@@ -1206,9 +1199,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let i = (y * w + x) * 4;
-                let r = (((x as f64 - 95.5).hypot(y as f64 - 95.5) / 90.0)
-                    .clamp(0.0, 1.0)
-                    * 32.0)
+                let r = (((x as f64 - 95.5).hypot(y as f64 - 95.5) / 90.0).clamp(0.0, 1.0) * 32.0)
                     .floor()
                     / 32.0;
                 px[i] = (30.0 + r * 200.0) as u8;
