@@ -250,7 +250,11 @@ fn flood_remove_background(
             let mut den = 0.0_f32;
             let to_lin = |u: u8| -> f32 {
                 let s = f32::from(u) / 255.0;
-                if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+                if s <= 0.04045 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
             };
             for c in 0..3 {
                 let diff_srgb = (f32::from(rgb[c]) - f32::from(fg[c])).abs();
@@ -523,7 +527,15 @@ mod tests {
         assert_eq!(rgba[at(0, 0) + 3], 0);
         assert_eq!(rgba[at(5, 5)], 0);
         assert_eq!(rgba[at(5, 5) + 3], 255);
-        assert!(rgba[at(1, 5)] < 20, "fringe RGB should unpremultiply toward black, got {}", rgba[at(1, 5)]);
-        assert!((110..=255).contains(&rgba[at(1, 5) + 3]), "fringe alpha should be boosted in 110..=255, got {}", rgba[at(1, 5) + 3]);
+        assert!(
+            rgba[at(1, 5)] < 20,
+            "fringe RGB should unpremultiply toward black, got {}",
+            rgba[at(1, 5)]
+        );
+        assert!(
+            (110..=255).contains(&rgba[at(1, 5) + 3]),
+            "fringe alpha should be boosted in 110..=255, got {}",
+            rgba[at(1, 5) + 3]
+        );
     }
 }

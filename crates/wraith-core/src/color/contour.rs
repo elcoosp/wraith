@@ -54,7 +54,24 @@ pub fn contours_with(
     nxt: &mut Vec<u32>,
     active: &[TileSpan],
 ) -> Vec<Vec<P>> {
-    const ISO: f32 = 0.5;
+    contours_with_iso(f, pw, ph, nxt, active, 0.5)
+}
+
+/// [`contours_with`] at an arbitrary iso level. Soft-edge bridge bands trace
+/// the per-pixel mixture field at several levels (0.25 … 0.75) to build the
+/// midtone sub-band rings.
+///
+/// # Panics
+///
+/// Panics if `f` is smaller than `pw * ph` — a caller invariant.
+pub fn contours_with_iso(
+    f: &[f32],
+    pw: usize,
+    ph: usize,
+    nxt: &mut Vec<u32>,
+    active: &[TileSpan],
+    iso: f32,
+) -> Vec<Vec<P>> {
     let hid = |x: usize, y: usize| (2 * (y * pw + x)) as u32; // horizontal edge id
     let vid = |x: usize, y: usize| (2 * (y * pw + x) + 1) as u32; // vertical edge id
     nxt.clear();
@@ -68,10 +85,10 @@ pub fn contours_with(
                     f[(y + 1) * pw + x + 1],
                     f[(y + 1) * pw + x],
                 );
-                let case = u8::from(vtl >= ISO)
-                    | u8::from(vtr >= ISO) << 1
-                    | u8::from(vbr >= ISO) << 2
-                    | u8::from(vbl >= ISO) << 3;
+                let case = u8::from(vtl >= iso)
+                    | u8::from(vtr >= iso) << 1
+                    | u8::from(vbr >= iso) << 2
+                    | u8::from(vbl >= iso) << 3;
                 if case == 0 || case == 15 {
                     continue;
                 }
@@ -91,7 +108,7 @@ pub fn contours_with(
                     13 => seg(r, t),
                     14 => seg(t, l),
                     5 => {
-                        if (vtl + vtr + vbr + vbl) * 0.25 >= ISO {
+                        if (vtl + vtr + vbr + vbl) * 0.25 >= iso {
                             seg(r, t);
                             seg(l, b);
                         } else {
@@ -100,7 +117,7 @@ pub fn contours_with(
                         }
                     }
                     10 => {
-                        if (vtl + vtr + vbr + vbl) * 0.25 >= ISO {
+                        if (vtl + vtr + vbr + vbl) * 0.25 >= iso {
                             seg(t, l);
                             seg(b, r);
                         } else {
@@ -125,7 +142,7 @@ pub fn contours_with(
         let t = if den.abs() < 1e-9 {
             0.5_f64
         } else {
-            f64::from(((ISO - v0) / den).clamp(0.0, 1.0))
+            f64::from(((iso - v0) / den).clamp(0.0, 1.0))
         };
         // padded lattice point (px,py) ↔ pixel centre (px-1+0.5, py-1+0.5)
         if horiz {
