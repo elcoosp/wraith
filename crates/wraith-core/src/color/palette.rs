@@ -273,52 +273,42 @@ fn merge_close(pal: &mut Vec<V3>, cnt: &mut Vec<f64>, thr: f32) {
 /// input for photo-like inputs without a heavy quantizer dependency).
 const UNIQUE_COLOR_CAP: usize = 32_768;
 
-/// Bins the unique colours to 5-bit RGB when their number exceeds the cap.
-/// Returns cluster points and their accumulated pixel counts.
 fn bounded_points(uniques: &Uniques) -> (Vec<V3>, Vec<f32>) {
     let ulab: Vec<V3> = uniques.colors.iter().map(|c| rgb_to_oklab(*c)).collect();
     if uniques.colors.len() <= UNIQUE_COLOR_CAP {
         return (ulab, uniques.count.clone());
     }
-    let mut bins: HashMap<u32, (usize, f32), BuildHasherDefault<Fx>> = FxMap::default();
+    let mut bins: HashMap<u32, (usize, [f64; 3], f64), BuildHasherDefault<Fx>> = FxMap::default();
     let mut order: Vec<u32> = Vec::new();
-    for (u, c) in uniques.colors.iter().enumerate() {
-        let key = (u32::from(c[0] >> 3) << 10) | (u32::from(c[1] >> 3) << 5) | u32::from(c[2] >> 3);
+    for (u, &c) in uniques.colors.iter().enumerate() {
+        let wt = f64::from(uniques.count[u]);
+        if wt <= 0.0 {
+            continue;
+        }
+        let [r, g, b] = c;
+        let key = (u32::from(r >> 3) << 10) | (u32::from(g >> 3) << 5) | u32::from(b >> 3);
         let e = bins.entry(key).or_insert_with(|| {
             order.push(key);
-            (order.len() - 1, 0.0)
+            (order.len() - 1, [0.0; 3], 0.0)
         });
-        e.1 += uniques.count[u];
+        let [l, a, bb] = ulab[u];
+        e.1[0] += f64::from(l) * wt;
+        e.1[1] += f64::from(a) * wt;
+        e.1[2] += f64::from(bb) * wt;
+        e.2 += wt;
     }
     let mut pts = vec![[0.0_f32; 3]; order.len()];
-    let mut w = vec![0.0_f32; order.len()];
-    for (key, (idx, cnt)) in bins {
-        let c = [
-            (((key >> 10) & 0x1f) << 3) as u8 + 4,
-            (((key >> 5) & 0x1f) << 3) as u8 + 4,
-            ((key & 0x1f) << 3) as u8 + 4,
-        ];
-        pts[idx] = rgb_to_oklab(c);
-        w[idx] = cnt;
+    let mut w_scalar = vec![0.0_f32; order.len()];
+    for (_, (idx, sum, cnt)) in bins {
+        if cnt > 0.0 {
+            let [s0, s1, s2] = sum;
+            pts[idx] = [(s0 / cnt) as f32, (s1 / cnt) as f32, (s2 / cnt) as f32];
+            w_scalar[idx] = cnt as f32;
+        }
     }
-    (pts, w)
+    (pts, w_scalar)
 }
 
-/// Builds the paint palette: k-means → merge → AA-ghost pruning → rank by
-/// pixel count (rank 0 = largest).
-///
-/// Ghost pruning (prototype §4.2): a palette colour is dropped when (a) fewer
-/// than 3% of its pixels form a 3×3 same-label interior — i.e. it is almost
-/// exclusively an anti-aliasing fringe — and (b) it lies within `ΔOklab` 0.03
-/// of the segment between two other palette colours, i.e. it is explained as
-/// a blend of its neighbours. A real flat 3×3 region survives; a 1-px AA band
-/// does not. The rule is safe in *over-segmented* mode too: ramp bands are
-/// wide enough to hold 3×3 interiors, so only true AA ghosts die and the
-/// ramp survives as a chain of adjacent bands.
-///
-/// When `over_segmented` is true (gradient detection on, roadmap M3 step 1),
-/// the cap is raised to ≥ 48 and the merge threshold is tightened so ramp
-/// steps survive; the merge/prune stages would otherwise collapse them.
 #[must_use]
 pub fn build_palette(
     uniques: &Uniques,
@@ -328,25 +318,15 @@ pub fn build_palette(
     over_segmented: bool,
 ) -> Vec<V3> {
     let (mut pts, mut wts) = bounded_points(uniques);
-    // Drop zero-weight points (fully transparent-only colours) so they cannot
-    // become seeds.
     let mut keep: Vec<usize> = (0..pts.len()).filter(|&i| wts[i] > 0.0).collect();
     keep.sort_unstable_by(|&a, &b| {
         wts[b]
             .partial_cmp(&wts[a])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let pts_kept: Vec<V3> = keep.iter().map(|&i| pts[i]).collect();
-    let wts_kept: Vec<f32> = keep.iter().map(|&i| wts[i]).collect();
-    pts = pts_kept;
-    wts = wts_kept;
+    pts = keep.iter().map(|&i| pts[i]).collect();
+    wts = keep.iter().map(|&i| wts[i]).collect();
 
-    // Over-segmentation raises the cap, but never beyond a third of the
-    // distinct colours: one centroid per shade would make every band 1 px
-    // wide (no 3×3 interior), and ghost pruning would then — correctly, by
-    // its own rule — treat the whole ramp as anti-aliasing. Real fixtures:
-    // 932 uniques → cap stays 48 (bands of ~19 shades); a 64 px icon with
-    // 100 uniques gets 33 bands of ~3 shades instead of a degenerate ramp.
     let cap = if over_segmented {
         settings.palette_cap().max(48).min((pts.len() / 3).max(4))
     } else {
@@ -359,20 +339,22 @@ pub fn build_palette(
         cnt0[nearest(*p, &pal)] += f64::from(wts[i]);
     }
     if over_segmented {
-        // Collapse near-identical colours (duplicate centroids) without
-        // eating ramp steps: the k-means spread over a quantised ramp puts
-        // some centroids within ΔOklab 0.004 of each other, while real
-        // neighbouring ramp steps sit ≥ 0.008 apart.
         merge_close(&mut pal, &mut cnt0, settings.merge_distance.min(0.004));
     } else {
         merge_close(&mut pal, &mut cnt0, settings.merge_distance);
     }
-    // Anti-aliasing ghost pruning rounds (both modes; see doc comment).
-    if uniques.colors.len() <= UNIQUE_COLOR_CAP {
-        prune_ghosts(&mut pal, uniques, w, h);
+    prune_ghosts(&mut pal, uniques, w, h);
+
+    if !over_segmented && pal.len() > 1 {
+        let noise_thr = refine_interior_medians(&mut pal, uniques, w, h);
+        let eff_merge = settings.merge_distance.max(noise_thr * 2.0);
+        let mut cnt_ref = vec![0.0_f64; pal.len()];
+        for (i, p) in pts.iter().enumerate() {
+            cnt_ref[nearest(*p, &pal)] += f64::from(wts[i]);
+        }
+        merge_close(&mut pal, &mut cnt_ref, eff_merge);
     }
 
-    // Rank by pixel count (descending, stable).
     let mut cnt = vec![0.0_f64; pal.len()];
     for (i, p) in pts.iter().enumerate() {
         cnt[nearest(*p, &pal)] += f64::from(wts[i]);
@@ -386,13 +368,60 @@ pub fn build_palette(
     order.iter().map(|&i| pal[i]).collect()
 }
 
-/// Rounds of AA-ghost pruning over the full-resolution labelling.
-///
-/// Rule (b) — "explained as a mixture of two other colours" — is evaluated in
-/// **gamma sRGB**, because that is the space rasterisers blend in: an sRGB
-/// blend lies on the straight segment between its endpoints there, while in
-/// Oklab a mid-blend deviates by up to ~0.1 (the same insight that places the
-/// mixture model in sRGB).
+fn refine_interior_medians(pal: &mut [V3], uniques: &Uniques, w: usize, h: usize) -> f32 {
+    if w < 3 || h < 3 || pal.is_empty() {
+        return 0.0;
+    }
+    let lab_u: Vec<usize> = uniques
+        .colors
+        .iter()
+        .map(|c| nearest(rgb_to_oklab(*c), pal))
+        .collect();
+    let mut ch_samples: Vec<[Vec<u8>; 3]> = vec![[Vec::new(), Vec::new(), Vec::new()]; pal.len()];
+    for y in 1..h - 1 {
+        let row = y * w;
+        for x in 1..w - 1 {
+            let i = row + x;
+            let uid = uniques.id[i] as usize;
+            if uniques.count[uid] <= 0.0 {
+                continue;
+            }
+            let l = lab_u[uid];
+            if lab_u[uniques.id[i - 1] as usize] == l
+                && lab_u[uniques.id[i + 1] as usize] == l
+                && lab_u[uniques.id[i - w] as usize] == l
+                && lab_u[uniques.id[i + w] as usize] == l
+            {
+                let [r, g, b] = uniques.colors[uid];
+                ch_samples[l][0].push(r);
+                ch_samples[l][1].push(g);
+                ch_samples[l][2].push(b);
+            }
+        }
+    }
+    let mut noise_samples: Vec<f32> = Vec::new();
+    for (k, [sr, sg, sb]) in ch_samples.iter_mut().enumerate() {
+        let len = sr.len();
+        if len < 16 {
+            continue;
+        }
+        sr.sort_unstable();
+        sg.sort_unstable();
+        sb.sort_unstable();
+        let med = [sr[len / 2], sg[len / 2], sb[len / 2]];
+        pal[k] = rgb_to_oklab(med);
+        let q25 = [sr[len / 4], sg[len / 4], sb[len / 4]];
+        let q75 = [sr[(len * 3) / 4], sg[(len * 3) / 4], sb[(len * 3) / 4]];
+        noise_samples.push(d2(rgb_to_oklab(q25), rgb_to_oklab(q75)).sqrt() * 0.5);
+    }
+    if noise_samples.is_empty() {
+        0.0
+    } else {
+        noise_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        noise_samples[noise_samples.len() / 2]
+    }
+}
+
 fn prune_ghosts(pal: &mut Vec<V3>, uniques: &Uniques, w: usize, h: usize) {
     for _ in 0..4 {
         if pal.len() < 3 {
@@ -403,15 +432,14 @@ fn prune_ghosts(pal: &mut Vec<V3>, uniques: &Uniques, w: usize, h: usize) {
             .iter()
             .map(|c| nearest(rgb_to_oklab(*c), pal) as u8)
             .collect();
-        // Normalised to 0..1 so the blend tolerance below is scale-free.
         let psrgb: Vec<V3> = pal
             .iter()
             .map(|c| {
-                let r = oklab_to_rgb(*c);
+                let [r, g, b] = oklab_to_rgb(*c);
                 [
-                    f32::from(r[0]) / 255.0,
-                    f32::from(r[1]) / 255.0,
-                    f32::from(r[2]) / 255.0,
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
                 ]
             })
             .collect();
@@ -440,7 +468,7 @@ fn prune_ghosts(pal: &mut Vec<V3>, uniques: &Uniques, w: usize, h: usize) {
                 removed[c] = true;
                 continue;
             }
-            if total[c] == 0 || (inner[c] as f32) / (total[c] as f32) > 0.03 {
+            if (inner[c] as f32) / (total[c] as f32) > 0.03 {
                 continue;
             }
             let p = psrgb[c];
