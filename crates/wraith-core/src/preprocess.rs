@@ -278,13 +278,7 @@ fn flood_remove_background(
             if a < 0.04 {
                 rgba[idx * 4 + 3] = 0;
             } else if a < 0.96 {
-                let fg_luma = 0.299 * f32::from(fg[0]) + 0.587 * f32::from(fg[1]) + 0.114 * f32::from(fg[2]);
-                let a_out = if fg_luma < 75.0 && a >= 0.28 {
-                    (a * 1.35).min(1.0)
-                } else {
-                    a
-                };
-                rgba[idx * 4 + 3] = (a_out * 255.0).round() as u8;
+                rgba[idx * 4 + 3] = (a * 255.0).round() as u8;
                 for c in 0..3 {
                     let l_bg = to_lin(rgb[c]);
                     let l_obs = to_lin(obs[c]);
