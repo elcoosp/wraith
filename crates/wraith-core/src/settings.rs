@@ -199,6 +199,13 @@ pub struct ColorSettings {
     /// Decompose edge pixels using only colours present in their 5x5
     /// neighbourhood (default on) instead of the global best-pair search.
     pub local_mixture: bool,
+    /// Emit midtone bridge bands along wide (≥ ~1.3 px) anti-aliased
+    /// transitions between high-contrast regions (default on). A sharp vector
+    /// boundary loses the quarter-step pixels on both sides of a soft ramp;
+    /// the bridge repaints the transition with the ramp's mean colour,
+    /// roughly halving the boundary error. Crisp 1-px edges are skipped by
+    /// the width gate.
+    pub edge_bands: bool,
 }
 
 impl Default for ColorSettings {
@@ -217,6 +224,7 @@ impl Default for ColorSettings {
             prefilter: false,
             field_blur: 1,
             local_mixture: true,
+            edge_bands: true,
         }
     }
 }
