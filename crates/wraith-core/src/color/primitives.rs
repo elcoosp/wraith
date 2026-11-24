@@ -513,7 +513,7 @@ mod tests {
                 Seg::Cubic(..) => {}
             }
         }
-        let shape = detect_ring(&dense, start, &segs, 0.3);
+        let shape = detect_ring(&dense, start, &segs, 0.3, 1_000_000);
         match shape {
             Some(Shape::Rect { x, y, w, h, r }) => {
                 assert!((x - x0).abs() < 1e-6 && (y - y0).abs() < 1e-6);
@@ -566,6 +566,6 @@ mod tests {
             },
         ];
         let dense: Vec<P> = vec![[0.0, 0.0], [50.0, 50.0], [55.0, 55.0]];
-        assert!(detect_ring(&dense, start, &segs, 0.3).is_none());
+        assert!(detect_ring(&dense, start, &segs, 0.3, 1_000_000).is_none());
     }
 }
