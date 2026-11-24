@@ -196,7 +196,7 @@ pub fn trace_color(
     let over_segmented = settings.gradients != Gradients::Off;
 
     let filtered_buf;
-    let work_pixels: &[u8] = if !over_segmented && w >= 5 && h >= 5 {
+    let work_pixels: &[u8] = if settings.prefilter && !over_segmented && w >= 5 && h >= 5 {
         filtered_buf = bilateral_denoise_rgba(&image.pixels, w, h);
         &filtered_buf
     } else {
