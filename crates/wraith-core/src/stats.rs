@@ -36,10 +36,16 @@ impl Stage {
 }
 
 /// Measures wall-clock time per pipeline stage.
+///
+/// Laps chain: after the first `start()`, every `lap()` records the elapsed
+/// time since the previous lap's end when no explicit `start()` intervened.
+/// Stage code that forgets to restart the clock therefore still gets a
+/// truthful timing instead of a silent `0.00 ms`.
 #[derive(Debug, Default)]
 pub struct Stopwatch {
     laps: Vec<(Stage, Duration)>,
     started: Option<std::time::Instant>,
+    last_end: Option<std::time::Instant>,
 }
 
 impl Stopwatch {
@@ -50,9 +56,16 @@ impl Stopwatch {
 
     /// Stops the current stage and records its duration.
     pub fn lap(&mut self, stage: Stage) {
-        let dur = self.started.map_or(Duration::ZERO, |t| t.elapsed());
+        let dur = if let Some(t) = self.started {
+            t.elapsed()
+        } else if let Some(t) = self.last_end {
+            t.elapsed()
+        } else {
+            Duration::ZERO
+        };
         self.laps.push((stage, dur));
         self.started = None;
+        self.last_end = Some(std::time::Instant::now());
     }
 
     /// Recorded stage durations, in execution order.
@@ -135,6 +148,25 @@ mod tests {
         let mut sw = Stopwatch::default();
         sw.lap(Stage::Minify);
         assert_eq!(sw.laps()[0].1, Duration::ZERO);
+    }
+
+    /// Consecutive stages may lap without an explicit `start()`: the clock
+    /// keeps running from the previous lap's end. Without this, every stage
+    /// after a `lap()` that forgot to restart the clock (the geometric
+    /// engine's palette/trace stages did exactly that) reported 0.00 ms and
+    /// the `--stats` output lied about where time went.
+    #[test]
+    fn consecutive_laps_without_start_stay_timed() {
+        let mut sw = Stopwatch::default();
+        sw.start();
+        std::thread::sleep(Duration::from_micros(40));
+        sw.lap(Stage::Decode);
+        std::thread::sleep(Duration::from_micros(40));
+        sw.lap(Stage::Preprocess);
+        let laps = sw.laps();
+        assert_eq!(laps.len(), 2);
+        assert!(laps[0].1 > Duration::ZERO);
+        assert!(laps[1].1 >= Duration::from_micros(30), "{:?}", laps[1]);
     }
 
     #[test]
