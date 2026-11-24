@@ -155,7 +155,7 @@ pub(crate) fn build_layers(
 ) -> std::vec::Vec<ColorLayer> {
     let n_px = w * h;
     let min_px = (settings.min_area_px2.ceil() as u32).max(4);
-    let (lab, comp, units) = paint_units(uniques, mix, regions, pixels, w, h, min_px);
+    let (lab, comp, units) = paint_units(uniques, mix, regions, pal, pixels, w, h, min_px);
     let unit_count = units.len();
     if unit_count == 0 {
         sw.lap(Stage::Trace);
@@ -853,13 +853,23 @@ struct PaintUnit {
     px: u32,
     border: bool,
 }
-fn absorb_small_components(lab: &mut [u16], w: usize, h: usize, min_px: u32) {
+fn absorb_small_components(
+    lab: &mut [u16],
+    reg_lab: &[Option<V3>],
+    w: usize,
+    h: usize,
+    min_px: u32,
+) {
+    const MAX_TEXTURE_D2: f32 = 0.075 * 0.075;
     let n = w * h;
     let none = u16::MAX;
+    let texture_max_px = min_px.max(((n / 650) as u32).max(min_px.saturating_mul(8)));
+
     let mut visited = vec![false; n];
     let mut stack = std::vec::Vec::new();
     let mut members = std::vec::Vec::new();
     let mut border_counts: std::vec::Vec<(u16, u32)> = std::vec::Vec::new();
+
     for start in 0..n {
         let reg = lab[start];
         if reg == none || visited[start] {
@@ -885,10 +895,14 @@ fn absorb_small_components(lab: &mut [u16], w: usize, h: usize, min_px: u32) {
                 }
             }
         }
-        if (members.len() as u32) >= min_px {
+
+        let area = members.len() as u32;
+        if area >= texture_max_px {
             continue;
         }
+
         border_counts.clear();
+        let mut total_border = 0_u32;
         for &p in &members {
             let (x, y) = (p % w, p / w);
             for &(dx, dy) in &[(1_usize, 0_usize), (usize::MAX, 0), (0, 1), (0, usize::MAX)] {
@@ -898,6 +912,7 @@ fn absorb_small_components(lab: &mut [u16], w: usize, h: usize, min_px: u32) {
                 }
                 let nreg = lab[ny * w + nx];
                 if nreg != none && nreg != reg {
+                    total_border += 1;
                     if let Some((_, c)) = border_counts.iter_mut().find(|(r, _)| *r == nreg) {
                         *c += 1;
                     } else {
@@ -906,18 +921,54 @@ fn absorb_small_components(lab: &mut [u16], w: usize, h: usize, min_px: u32) {
                 }
             }
         }
-        if let Some(best) = border_counts.iter().max_by_key(|item| item.1) {
-            let best_reg = best.0;
-            for &p in &members {
-                lab[p] = best_reg;
+
+        if total_border == 0 {
+            continue;
+        }
+
+        if area < min_px {
+            if let Some(&(best_reg, _)) = border_counts.iter().max_by_key(|item| item.1) {
+                for &p in &members {
+                    lab[p] = best_reg;
+                }
+            }
+            continue;
+        }
+
+        // For larger regions up to `texture_max_px`, check how much of the perimeter
+        // is shared with perceptually close neighbours (internal mottling/texture).
+        let c1 = reg_lab.get(reg as usize).copied().flatten();
+        let mut low_contrast_border = 0_u32;
+        let mut best_low_reg: Option<(u16, u32)> = None;
+
+        if let Some(c1) = c1 {
+            for &(nreg, cnt) in &border_counts {
+                if let Some(c2) = reg_lab.get(nreg as usize).copied().flatten() {
+                    if crate::color::palette::d2(c1, c2) <= MAX_TEXTURE_D2 {
+                        low_contrast_border += cnt;
+                        if best_low_reg.is_none_or(|(_, bc)| cnt > bc) {
+                            best_low_reg = Some((nreg, cnt));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((target_reg, _)) = best_low_reg {
+            if low_contrast_border.saturating_mul(100) >= total_border.saturating_mul(75) {
+                for &p in &members {
+                    lab[p] = target_reg;
+                }
             }
         }
     }
 }
+
 fn paint_units(
     uniques: &Uniques,
     mix: &Mixture,
     regions: &Regions,
+    pal: &[V3],
     pixels: &[u8],
     w: usize,
     h: usize,
@@ -937,7 +988,13 @@ fn paint_units(
             }
         })
         .collect::<std::vec::Vec<_>>();
-    absorb_small_components(&mut lab, w, h, min_px);
+    let reg_lab: std::vec::Vec<Option<V3>> = (0..regions.kinds.len())
+        .map(|r| match regions.kinds[r] {
+            RegionKind::Flat => Some(pal[regions.flat_rank[r]]),
+            RegionKind::Gradient(_) => None,
+        })
+        .collect();
+    absorb_small_components(&mut lab, &reg_lab, w, h, min_px);
     let mut comp = vec![u32::MAX; n];
     let mut units = std::vec::Vec::new();
     let mut stack = std::vec::Vec::new();

@@ -196,8 +196,9 @@ pub fn trace_color(
     let over_segmented = settings.gradients != Gradients::Off;
 
     let filtered_buf;
-    let work_pixels: &[u8] = if settings.prefilter && !over_segmented && w >= 5 && h >= 5 {
-        filtered_buf = bilateral_denoise_rgba(&image.pixels, w, h);
+    let work_pixels: &[u8] = if settings.prefilter && w >= 3 && h >= 3 {
+        let pass1 = conditional_median_rgba(&image.pixels, w, h);
+        filtered_buf = conditional_median_rgba(&pass1, w, h);
         &filtered_buf
     } else {
         &image.pixels
@@ -248,71 +249,48 @@ pub fn trace_color(
     }
 }
 
-/// Fast 2-pass edge-preserving bilateral filter (5×5 kernel, σ_color = 26)
-/// over opaque pixels (`alpha == 255`), leaving semi-transparent edge pixels
-/// untouched so sub-pixel AA coverage stays exact.
-fn bilateral_denoise_rgba(src: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut cur = src.to_vec();
-    let mut nxt = cur.clone();
-    const SPATIAL: [[f32; 5]; 5] = [
-        [0.3679, 0.5353, 0.6065, 0.5353, 0.3679],
-        [0.5353, 0.7788, 0.8825, 0.7788, 0.5353],
-        [0.6065, 0.8825, 1.0000, 0.8825, 0.6065],
-        [0.5353, 0.7788, 0.8825, 0.7788, 0.5353],
-        [0.3679, 0.5353, 0.6065, 0.5353, 0.3679],
-    ];
-    let mut range_lut = vec![0.0_f32; 3 * 255 * 255 + 1];
-    let inv_two_sig2 = -1.0_f32 / (2.0 * 26.0 * 26.0);
-    for (d2, val) in range_lut.iter_mut().enumerate() {
-        *val = ((d2 as f32) * inv_two_sig2).exp();
-    }
-    for _pass in 0..2 {
-        for y in 0..h {
-            let row = y * w;
-            for x in 0..w {
-                let idx = (row + x) * 4;
-                if cur[idx + 3] < 255 {
-                    continue;
-                }
-                let (r0, g0, b0) = (
-                    i32::from(cur[idx]),
-                    i32::from(cur[idx + 1]),
-                    i32::from(cur[idx + 2]),
-                );
-                let (mut sr, mut sg, mut sb, mut sw) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-                let y_lo = y.saturating_sub(2);
-                let y_hi = (y + 2).min(h - 1);
-                let x_lo = x.saturating_sub(2);
-                let x_hi = (x + 2).min(w - 1);
-                for ny in y_lo..=y_hi {
-                    let wy_idx = ny + 2 - y;
-                    let nrow = ny * w;
-                    for nx in x_lo..=x_hi {
-                        let nidx = (nrow + nx) * 4;
-                        if cur[nidx + 3] < 255 {
-                            continue;
-                        }
-                        let dr = i32::from(cur[nidx]) - r0;
-                        let dg = i32::from(cur[nidx + 1]) - g0;
-                        let db = i32::from(cur[nidx + 2]) - b0;
-                        let d2 = (dr * dr + dg * dg + db * db) as usize;
-                        let wgt = SPATIAL[wy_idx][nx + 2 - x] * range_lut[d2];
-                        sr += f32::from(cur[nidx]) * wgt;
-                        sg += f32::from(cur[nidx + 1]) * wgt;
-                        sb += f32::from(cur[nidx + 2]) * wgt;
-                        sw += wgt;
+/// Edge-preserving conditional median filter (3×3 in Oklab).
+fn conditional_median_rgba(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    const MAX_D2: f32 = 0.045 * 0.045;
+    let mut dst = src.to_vec();
+    let lab: Vec<palette::V3> = src
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&[r, g, b, _]| palette::rgb_to_oklab([r, g, b]))
+        .collect();
+    let (mut r_buf, mut g_buf, mut b_buf) = ([0_u8; 9], [0_u8; 9], [0_u8; 9]);
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let i = y * w + x;
+            if src[i * 4 + 3] != 255 {
+                continue;
+            }
+            let c0 = lab[i];
+            let mut count = 0_usize;
+            for dy in -1_isize..=1 {
+                for dx in -1_isize..=1 {
+                    let ni = y.wrapping_add_signed(dy) * w + x.wrapping_add_signed(dx);
+                    if src[ni * 4 + 3] == 255 && palette::d2(c0, lab[ni]) <= MAX_D2 {
+                        r_buf[count] = src[ni * 4];
+                        g_buf[count] = src[ni * 4 + 1];
+                        b_buf[count] = src[ni * 4 + 2];
+                        count += 1;
                     }
                 }
-                if sw > 0.0 {
-                    nxt[idx] = (sr / sw).round().clamp(0.0, 255.0) as u8;
-                    nxt[idx + 1] = (sg / sw).round().clamp(0.0, 255.0) as u8;
-                    nxt[idx + 2] = (sb / sw).round().clamp(0.0, 255.0) as u8;
-                }
+            }
+            if count >= 5 {
+                r_buf[..count].sort_unstable();
+                g_buf[..count].sort_unstable();
+                b_buf[..count].sort_unstable();
+                let mid = count / 2;
+                dst[i * 4] = r_buf[mid];
+                dst[i * 4 + 1] = g_buf[mid];
+                dst[i * 4 + 2] = b_buf[mid];
             }
         }
-        std::mem::swap(&mut cur, &mut nxt);
     }
-    cur
+    dst
 }
 
 #[cfg(test)]
