@@ -224,6 +224,64 @@ pub fn trace_color(
         }
     };
 
+    // When gradient detection accepted no group at all, the over-segmented
+    // palette bought nothing: its extra thin shade ranks only carve AA
+    // fringes and blend strips into separate flat bands, and the rejected
+    // groups fall back 1:1 onto those bands. Compare the two palette
+    // variants with the label-map quantisation error
+    // ([`layers::label_interior_error`]) and keep the coarse merge when it
+    // wins on BOTH proxies: the full-map error (edge/blend-strip behaviour,
+    // where the coarse merge recovers flat-band quality — mascot 9.79 →
+    // 8.89 RMSE) and the interior-only error, which is what detects the
+    // merged-facet failure mode (mascot-danger: unguarded flip 8.47 →
+    // 14.64 RMSE, interior error +8 %). Measured margins across 12 corpus
+    // images: real wins move the full error −3.6..−8 % with interior
+    // between −12.6 % and +1.8 %; the failure case is full −1.8 % with
+    // interior +8 % — hence: flip on full ≥ 3 % better while interior is
+    // at most 3 % worse. Images with at least one accepted gradient keep
+    // the over-segmented palette the gradients need.
+    let (pal, mix, regions) = if settings.gradients != Gradients::Off
+        && regions.gradient_defs.is_empty()
+    {
+        let coarse = palette::build_palette(&uniques, w, h, settings, false);
+        let coarse_mix = model::build_model(&uniques, &coarse);
+        let coarse_regions = {
+            let counts = gradients::rank_pixel_counts(&uniques, work_pixels, &coarse_mix);
+            gradients::flat_regions(coarse.len(), &counts)
+        };
+        let (overseg_full, overseg_int) = layers::label_quant_error(
+            &uniques,
+            work_pixels,
+            &pal,
+            &mix,
+            &regions,
+            w,
+            h,
+            settings,
+        );
+        let (coarse_full, coarse_int) = layers::label_quant_error(
+            &uniques,
+            work_pixels,
+            &coarse,
+            &coarse_mix,
+            &coarse_regions,
+            w,
+            h,
+            settings,
+        );
+        const FULL_WIN: f64 = 0.97;
+        const INTERIOR_LOSS_MAX: f64 = 1.03;
+        if coarse_full < overseg_full * FULL_WIN
+            && coarse_int < overseg_int * INTERIOR_LOSS_MAX
+        {
+            (coarse, coarse_mix, coarse_regions)
+        } else {
+            (pal, mix, regions)
+        }
+    } else {
+        (pal, mix, regions)
+    };
+
     // 5) per-unit fields → contours → fit → refine → primitives (paint
     // units and their order are derived inside `build_layers`)
     let background_rect = background == Background::None && !uniques.any_alpha;
