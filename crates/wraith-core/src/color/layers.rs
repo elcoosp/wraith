@@ -142,6 +142,89 @@ fn local_mixture(
     (d < 28.0 * 28.0).then_some((a, b, t))
 }
 
+/// Debug hook for the out-of-tree `diag` driver (enabled by the `metrics`
+/// feature): runs the same label pass as [`build_layers`] and returns the
+/// per-pixel region map plus each region's median fill, without tracing.
+#[cfg(feature = "metrics")]
+pub fn debug_labels(
+    uniques: &Uniques,
+    pixels: &[u8],
+    pal: &[V3],
+    mix: &Mixture,
+    regions: &Regions,
+    w: usize,
+    h: usize,
+    settings: &ColorSettings,
+) -> (std::vec::Vec<u16>, std::vec::Vec<[u8; 3]>) {
+    let min_px = (settings.min_area_px2.ceil() as u32).max(4);
+    let (lab, _comp, _units, fills) =
+        paint_units(uniques, mix, regions, pal, pixels, w, h, min_px);
+    (lab, fills)
+}
+
+/// Label-map quantisation error of a palette variant: RMS colour distance
+/// between every pixel and its region's median fill, returned as
+/// `(full, interior)`. The interior figure counts only pixels whose
+/// 4-neighbours share the label — boundary pixels are excluded there,
+/// because their error is dominated by anti-aliasing, which both palette
+/// variants carry, and would drown out the signal.
+///
+/// Used as the variant-quality proxy for the coarse-fallback decision in
+/// `mod.rs`. Measured on the 18-image mascot corpus: the full error tracks
+/// flat-band quality on smooth-ramp images (mascot −3.6 %, gsx −8 %), while
+/// the interior error is what exposes the merged-facet failure mode
+/// (mascot-danger +8 % where the unguarded flip cost 6.2 RMSE) — so the
+/// decision requires a clear full-error win AND no meaningful interior
+/// loss.
+pub(crate) fn label_quant_error(
+    uniques: &Uniques,
+    pixels: &[u8],
+    pal: &[V3],
+    mix: &Mixture,
+    regions: &Regions,
+    w: usize,
+    h: usize,
+    settings: &ColorSettings,
+) -> (f64, f64) {
+    let min_px = (settings.min_area_px2.ceil() as u32).max(4);
+    let (lab, _comp, _units, fills) =
+        paint_units(uniques, mix, regions, pal, pixels, w, h, min_px);
+    let mut acc = 0.0_f64;
+    let mut iacc = 0.0_f64;
+    let mut n = 0.0_f64;
+    let mut inn = 0.0_f64;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let l = lab[i];
+            if l == u16::MAX {
+                continue;
+            }
+            let f = fills[l as usize];
+            let p = i * 4;
+            let mut e2 = 0.0_f64;
+            for ch in 0..3 {
+                let d = f32::from(pixels[p + ch]) - f32::from(f[ch]);
+                e2 += f64::from(d * d);
+            }
+            acc += e2;
+            n += 1.0;
+            let interior = (x > 0 && lab[i - 1] == l)
+                && (x + 1 < w && lab[i + 1] == l)
+                && (y > 0 && lab[i - w] == l)
+                && (y + 1 < h && lab[i + w] == l);
+            if interior {
+                iacc += e2;
+                inn += 1.0;
+            }
+        }
+    }
+    (
+        (acc / (n * 3.0).max(1.0)).sqrt(),
+        (iacc / (inn * 3.0).max(1.0)).sqrt(),
+    )
+}
+
 pub(crate) fn build_layers(
     uniques: &Uniques,
     pixels: &[u8],
@@ -153,10 +236,10 @@ pub(crate) fn build_layers(
     settings: &ColorSettings,
     background_rect: bool,
     sw: &mut Stopwatch,
-) -> std::vec::Vec<ColorLayer> {
-    let n_px = w * h;
+) -> std::vec::Vec<ColorLayer> {    let n_px = w * h;
     let min_px = (settings.min_area_px2.ceil() as u32).max(4);
-    let (lab, comp, units) = paint_units(uniques, mix, regions, pal, pixels, w, h, min_px);
+    let (lab, comp, units, region_fills) =
+        paint_units(uniques, mix, regions, pal, pixels, w, h, min_px);
     let unit_count = units.len();
     if unit_count == 0 {
         sw.lap(Stage::Trace);
@@ -189,7 +272,7 @@ pub(crate) fn build_layers(
     let reg_rgb: std::vec::Vec<Option<V3>> = (0..regions.kinds.len())
         .map(|r| match regions.kinds[r] {
             RegionKind::Flat => {
-                let [r0, g0, b0] = oklab_to_rgb(pal[regions.flat_rank[r]]);
+                let [r0, g0, b0] = region_fills[r];
                 Some([f32::from(r0), f32::from(g0), f32::from(b0)])
             }
             _ => None,
@@ -332,7 +415,7 @@ pub(crate) fn build_layers(
                 settings.primitives,
             );
             (!shapes.is_empty()).then(|| ColorLayer {
-                paint: paint_of_rank(rank, &unit_of_rank, &units, regions, pal),
+                paint: paint_of_rank(rank, &unit_of_rank, &units, regions, &region_fills),
                 shapes,
             })
         })
@@ -344,7 +427,7 @@ pub(crate) fn build_layers(
         &unit_of_rank,
         &units,
         regions,
-        pal,
+        &region_fills,
         pixels,
         w,
         h,
@@ -352,17 +435,27 @@ pub(crate) fn build_layers(
     );
 
     let mut layers = Vec::new();
-    if let Some(underlay) =
-        (!background_rect)
-            .then(|| build_silhouette_underlay(pixels, pal, regions, w, h, tol, corner_rad, smooth))
-            .flatten()
+    if let Some(underlay) = (!background_rect)
+        .then(|| {
+            build_silhouette_underlay(
+                pixels,
+                regions,
+                &region_fills,
+                w,
+                h,
+                tol,
+                corner_rad,
+                smooth,
+            )
+        })
+        .flatten()
     {
         layers.push(underlay);
     }
     for (rank, layer) in results.into_iter().enumerate() {
         if rank == 0 && skip_rank0 {
             layers.push(ColorLayer {
-                paint: paint_of_rank(0, &unit_of_rank, &units, regions, pal),
+                paint: paint_of_rank(0, &unit_of_rank, &units, regions, &region_fills),
                 shapes: vec![Shape::Rect {
                     x: 0.0,
                     y: 0.0,
@@ -429,6 +522,24 @@ fn prune_floating_coverage(accs: &mut [UnitAcc], px_later: &[PxLater], w: usize,
 /// (mirrors the [`local_mixture`] acceptance gate).
 const BAND_RESIDUAL2: f32 = 28.0 * 28.0;
 
+/// Mixture window kept in the band field: pixels outside it clamp to 0 so
+/// the iso rings hug the transition instead of wrapping the whole parent.
+const BAND_T_LO: f32 = 0.125;
+const BAND_T_HI: f32 = 0.875;
+
+/// P90−P10 spread of the collected mixture weights under which a transition
+/// is a *constant-t* band rather than a spatial ramp.
+///
+/// A wide soft strip whose every pixel decomposes to the same blend ratio
+/// (the palette gave it no rank of its own, so each pixel sits on the same
+/// segment between two flat ranks — measured on the mascot corpus: a ~10 px
+/// shading strip at t≈0.24 between the yellow facet and the dark band)
+/// renders worst as the dominant parent's opaque fill (ΔRGB ≈ half the
+/// contrast across the whole strip) and best as one flat band filled with
+/// the strip's own colour. A genuine ramp sweeps the window, so its spread
+/// is far above this floor.
+const CONST_T_SPREAD: f32 = 0.2;
+
 /// Collects one pixel into the per-rank-pair band accumulator when it sits
 /// inside a wide anti-aliased transition (mixture weight 0.25..=0.75 between
 /// two distinct units).
@@ -463,7 +574,7 @@ fn collect_edge_band(
     // Local cross decomposition: the pixel sits between its own two units.
     if pa != pb && eff_wa > 0.0 && eff_wb > 0.0 && ra != usize::MAX && rb != usize::MAX {
         let t_eff = eff_wb / (eff_wa + eff_wb);
-        if (0.25..=0.75).contains(&t_eff) {
+        if (BAND_T_LO..=BAND_T_HI).contains(&t_eff) {
             let key = (ra.min(rb) as u32, ra.max(rb) as u32);
             band_acc.entry(key).or_default().push((i as u32, t_eff));
         }
@@ -476,7 +587,7 @@ fn collect_edge_band(
     // the pixel carries one of their labels. Units are re-resolved here with
     // a radius-2 window, which reaches over the 1–2 px the local votes miss.
     let (ga, gb, gt) = (mix.a[uid], mix.b[uid], mix.t[uid]);
-    if !(0.25..=0.75).contains(&gt) {
+    if !(BAND_T_LO..=BAND_T_HI).contains(&gt) {
         return;
     }
     let ra2 = usize::from(band_to_region[ga as usize]);
@@ -500,7 +611,14 @@ fn collect_edge_band(
         return;
     }
     let ua = unit_for_region_within(ra2, i, comp, lab, w, h, 2);
-    let ub = unit_for_region_within(rb2, i, comp, lab, w, h, 2);
+    // The other side's unit may sit well beyond the strip when the palette
+    // gave the strip no rank of its own: its pixels all label the dominant
+    // region (measured: a ~10 px shading strip at t≈0.25 whose blend-partner
+    // labels start 8–40 px away), so the partner lookup needs a radius that
+    // reaches across the strip. The seg_fit gate above already pins the
+    // pixel to the two regions' colour segment, so a distant unit can only
+    // widen the pair's point set, never mislabel a non-blend pixel.
+    let ub = unit_for_region_within(rb2, i, comp, lab, w, h, 12);
     if let (Some(ua), Some(ub)) = (ua, ub) {
         let (ru, rv) = (ranks[ua as usize] as usize, ranks[ub as usize] as usize);
         if ru != rv && ru != usize::MAX && rv != usize::MAX {
@@ -550,12 +668,20 @@ fn paint_mean_rgb(paint: &Paint, gradient_defs: &[crate::color::GradientDef]) ->
 /// iso-0.25 region minus the nested iso-0.75 region (inner rings reversed,
 /// so the nonzero fill rule subtracts them). Crisp 1-px AA edges fail the
 /// width gate and stay sharp.
+///
+/// A *constant-t* transition (every collected pixel holds the same blend
+/// ratio — the palette gave the strip no rank of its own, see
+/// [`CONST_T_SPREAD`]) has no t-field iso crossing, so it renders as one
+/// flat band traced from the collected coverage at iso 0.5 and filled with
+/// the strip's own mean colour. Without it, opaque parent fills paint the
+/// whole strip in the dominant parent's colour — the measured source of the
+/// yellow fringe/dots along soft shading edges on the mascot corpus.
 fn build_edge_band_layers(
     band_acc: &HashMap<(u32, u32), Vec<(u32, f32)>>,
     unit_of_rank: &[usize],
     units: &[PaintUnit],
     regions: &Regions,
-    pal: &[V3],
+    region_fills: &[[u8; 3]],
     pixels: &[u8],
     w: usize,
     h: usize,
@@ -572,10 +698,6 @@ fn build_edge_band_layers(
     /// Strip widths (px) that trigger 2 and 3 sub-bands.
     const WIDE2: f64 = 3.2;
     const WIDE3: f64 = 6.0;
-    /// Mixture window kept in the field: pixels outside it clamp to 0 so the
-    /// iso rings hug the transition instead of wrapping the whole parent.
-    const T_LO: f32 = 0.125;
-    const T_HI: f32 = 0.875;
 
     if band_acc.is_empty() || w < 3 || h < 3 {
         return Vec::new();
@@ -590,8 +712,8 @@ fn build_edge_band_layers(
         if pts.len() < BAND_MIN_PX {
             continue;
         }
-        let pa = paint_of_rank(ra as usize, unit_of_rank, units, regions, pal);
-        let pb = paint_of_rank(rb as usize, unit_of_rank, units, regions, pal);
+        let pa = paint_of_rank(ra as usize, unit_of_rank, units, regions, region_fills);
+        let pb = paint_of_rank(rb as usize, unit_of_rank, units, regions, region_fills);
         let ca = rgb_to_oklab(paint_mean_rgb(&pa, &regions.gradient_defs));
         let cb = rgb_to_oklab(paint_mean_rgb(&pb, &regions.gradient_defs));
         if crate::color::palette::d2(ca, cb).sqrt() < CONTRAST_MIN {
@@ -600,7 +722,7 @@ fn build_edge_band_layers(
         let (mut minx, mut miny) = (w, h);
         let (mut maxx, mut maxy) = (0_usize, 0_usize);
         for &(i, t) in pts {
-            if t < T_LO || t > T_HI {
+            if !(BAND_T_LO..=BAND_T_HI).contains(&t) {
                 continue;
             }
             let (x, y) = (i as usize % w, i as usize / w);
@@ -619,13 +741,32 @@ fn build_edge_band_layers(
         let bw = x1 - x0;
         let bh = y1 - y0;
         let (spw, sph) = (bw + 2, bh + 2);
+        // Mixture-weight spread of the collected pixels: a spatial ramp
+        // sweeps the window, while a constant-t strip holds one blend ratio
+        // (see [`CONST_T_SPREAD`]). Ramps trace the t-field; constant-t
+        // strips trace the collected coverage and render as one flat band —
+        // a constant t-field has no iso crossing to trace.
+        let mut ts: Vec<f32> = pts
+            .iter()
+            .map(|&(_, t)| t)
+            .filter(|t| (BAND_T_LO..=BAND_T_HI).contains(t))
+            .collect();
+        if ts.len() < BAND_MIN_PX {
+            continue;
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let constant_t = ts[ts.len() * 9 / 10] - ts[ts.len() / 10] < CONST_T_SPREAD;
+
         let mut field = vec![0.0_f32; spw * sph];
         for &(i, t) in pts {
-            if t < T_LO || t > T_HI {
+            if !(BAND_T_LO..=BAND_T_HI).contains(&t) {
+                continue;
+            }
+            if !constant_t && !(0.25..=0.75).contains(&t) {
                 continue;
             }
             let (x, y) = (i as usize % w, i as usize / w);
-            field[(y - y0 + 1) * spw + (x - x0 + 1)] = t;
+            field[(y - y0 + 1) * spw + (x - x0 + 1)] = if constant_t { 1.0 } else { t };
         }
         // The width/area gate measures the *raw* mixture field: the binomial
         // blur below smears t sideways, inflating the strip and hiding real
@@ -660,12 +801,23 @@ fn build_edge_band_layers(
                 })
                 .collect::<Vec<_>>()
         };
-        let outer = trace_iso(&field, 0.25, &mut nxt);
-        let inner = trace_iso(&field, 0.75, &mut nxt);
+        let (outer, inner, gate_iso) = if constant_t {
+            (trace_iso(&field, 0.5, &mut nxt), Vec::new(), 0.5_f32)
+        } else {
+            (
+                trace_iso(&field, 0.25, &mut nxt),
+                trace_iso(&field, 0.75, &mut nxt),
+                0.25_f32,
+            )
+        };
         // Gate measurement on the raw field (see above); the blurred rings
         // remain the emitted geometry.
-        let raw_outer = trace_iso(&raw, 0.25, &mut nxt);
-        let raw_inner = trace_iso(&raw, 0.75, &mut nxt);
+        let raw_outer = trace_iso(&raw, gate_iso, &mut nxt);
+        let raw_inner = if constant_t {
+            Vec::new()
+        } else {
+            trace_iso(&raw, 0.75, &mut nxt)
+        };
         let strip_area = raw_outer
             .iter()
             .map(|r| fit::area(&dedupe_ring(r)).abs())
@@ -686,17 +838,26 @@ fn build_edge_band_layers(
             continue;
         }
         // Sub-band count from measured width; each sub-band is one layer.
-        let n_sub = if width >= WIDE3 {
+        // A constant-t strip is always one flat band (its fill is the
+        // strip's own mean colour, so quantising further would only add
+        // seams).
+        let n_sub = if constant_t {
+            1
+        } else if width >= WIDE3 {
             3
         } else if width >= WIDE2 {
             2
         } else {
             1
         };
-        let isos: Vec<f32> = match n_sub {
-            3 => vec![0.25, 5.0 / 12.0, 7.0 / 12.0, 0.75],
-            2 => vec![0.25, 0.5, 0.75],
-            _ => vec![0.25, 0.75],
+        let isos: Vec<f32> = if constant_t {
+            vec![BAND_T_LO, BAND_T_HI]
+        } else {
+            match n_sub {
+                3 => vec![0.25, 5.0 / 12.0, 7.0 / 12.0, 0.75],
+                2 => vec![0.25, 0.5, 0.75],
+                _ => vec![0.25, 0.75],
+            }
         };
         for k in 0..isos.len() - 1 {
             let (lo_iso, hi_iso) = (isos[k], isos[k + 1]);
@@ -780,15 +941,15 @@ fn ring_perim(ring: &[P]) -> f64 {
 
 fn build_silhouette_underlay(
     pixels: &[u8],
-    pal: &[V3],
     regions: &Regions,
+    region_fills: &[[u8; 3]],
     w: usize,
     h: usize,
     tol: f64,
     corner_rad: f64,
     smooth: usize,
 ) -> std::option::Option<ColorLayer> {
-    if w < 3 || h < 3 || pal.is_empty() {
+    if w < 3 || h < 3 || region_fills.is_empty() {
         return None;
     }
     let n = w * h;
@@ -892,20 +1053,19 @@ fn build_silhouette_underlay(
         return None;
     }
 
-    let mut best_pal = 0_usize;
+    let mut best_reg = 0_usize;
     let mut best_l = f32::MAX;
     for (reg, &kind) in regions.kinds.iter().enumerate() {
         if kind == RegionKind::Flat && regions.pixel_count[reg] >= 16 {
-            let p_idx = regions.flat_rank[reg];
-            let [l, _, _] = pal[p_idx];
+            let [l, _, _] = rgb_to_oklab(region_fills[reg]);
             if l < best_l {
                 best_l = l;
-                best_pal = p_idx;
+                best_reg = reg;
             }
         }
     }
     Some(ColorLayer {
-        paint: Paint::Solid(oklab_to_rgb(pal[best_pal])),
+        paint: Paint::Solid(region_fills[best_reg]),
         shapes,
     })
 }
@@ -1034,7 +1194,12 @@ fn paint_units(
     w: usize,
     h: usize,
     min_px: u32,
-) -> (Vec<u16>, Vec<u32>, Vec<PaintUnit>) {
+) -> (
+    Vec<u16>,
+    Vec<u32>,
+    Vec<PaintUnit>,
+    Vec<[u8; 3]>,
+) {
     let n = w * h;
     let none = u16::MAX;
     let mut lab = uniques
@@ -1049,9 +1214,16 @@ fn paint_units(
             }
         })
         .collect::<std::vec::Vec<_>>();
+    // Per-region fill colours: the median sRGB of the pixels actually
+    // labelled with each region. The k-means palette centroids can drift off
+    // the true shade of over-segmented texture groups (measured: rejected
+    // gradient groups falling back to `pal[rank]` painted the mascot-tip
+    // chest ≈47 000 px up to ΔRGB 31 too dark), so every flat region is
+    // repainted from its own pixels instead of the centroid.
+    let region_fills = region_median_fills(&lab, pixels, regions, pal);
     let reg_lab: std::vec::Vec<Option<V3>> = (0..regions.kinds.len())
         .map(|r| match regions.kinds[r] {
-            RegionKind::Flat => Some(pal[regions.flat_rank[r]]),
+            RegionKind::Flat => Some(rgb_to_oklab(region_fills[r])),
             RegionKind::Gradient(_) => None,
         })
         .collect();
@@ -1094,7 +1266,54 @@ fn paint_units(
             }
         }
     }
-    (lab, comp, units)
+    (lab, comp, units, region_fills)
+}
+
+/// Sample cap (px) for the per-region median fill.
+const REGION_FILL_SAMPLE_CAP: usize = 8192;
+
+/// Median sRGB of the pixels labelled with each region (strided sample,
+/// capped at [`REGION_FILL_SAMPLE_CAP`] px per region). Regions without
+/// labelled pixels fall back to their palette rank's centroid.
+///
+/// The k-means centroids are means over *unique colours* weighted by
+/// frequency — when the palette is over-segmented (texture shades split into
+/// many ranks) the centroids drift off the true fill and the whole region
+/// renders too dark/light. The median of the actual pixels is robust to that
+/// drift, so flat regions are painted from it instead.
+fn region_median_fills(lab: &[u16], pixels: &[u8], regions: &Regions, pal: &[V3]) -> Vec<[u8; 3]> {
+    let mut buckets: Vec<Vec<[u8; 3]>> = (0..regions.kinds.len()).map(|_| Vec::new()).collect();
+    for (i, &reg) in lab.iter().enumerate() {
+        if reg != u16::MAX {
+            let p = i * 4;
+            buckets[reg as usize].push([pixels[p], pixels[p + 1], pixels[p + 2]]);
+        }
+    }
+    buckets
+        .into_iter()
+        .enumerate()
+        .map(|(reg, px)| {
+            if px.len() < 16 {
+                return match regions.flat_rank[reg] {
+                    r if r != usize::MAX => oklab_to_rgb(pal[r]),
+                    _ => [0, 0, 0],
+                };
+            }
+            let step = px.len().div_ceil(REGION_FILL_SAMPLE_CAP);
+            let mut chan: [Vec<u8>; 3] = std::array::from_fn(|_| {
+                Vec::with_capacity(px.len() / step + 1)
+            });
+            for c in px.into_iter().step_by(step) {
+                for ch in 0..3 {
+                    chan[ch].push(c[ch]);
+                }
+            }
+            std::array::from_fn(|ch| {
+                chan[ch].sort_unstable();
+                chan[ch][chan[ch].len() / 2]
+            })
+        })
+        .collect()
 }
 fn unit_for_region(
     region: usize,
@@ -1138,13 +1357,13 @@ fn paint_of_rank(
     unit_of_rank: &[usize],
     units: &[PaintUnit],
     regions: &Regions,
-    pal: &[V3],
+    region_fills: &[[u8; 3]],
 ) -> Paint {
     let unit = unit_of_rank[rank];
     let region = units[unit].region as usize;
     match regions.kinds[region] {
         RegionKind::Gradient(idx) => Paint::Gradient(idx),
-        RegionKind::Flat => Paint::Solid(oklab_to_rgb(pal[regions.flat_rank[region]])),
+        RegionKind::Flat => Paint::Solid(region_fills[region]),
     }
 }
 fn build_rank_field_table(
