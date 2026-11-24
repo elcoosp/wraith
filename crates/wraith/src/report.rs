@@ -35,14 +35,17 @@ pub fn file_line(r: &FileResult, color: bool) -> String {
     paint(&base, "32", color)
 }
 
-/// Renders per-file stage timings.
+/// Renders per-file stage timings, followed by the engine's palette and
+/// path accounting (the numbers `--json` also carries per file).
 #[must_use]
 pub fn timing_line(stats: &wraith_core::ConvertStats) -> String {
-    let parts: Vec<String> = stats
+    let mut parts: Vec<String> = stats
         .timings
         .iter()
         .map(|(stage, dur)| format!("{} {:.2}ms", stage.as_str(), dur.as_secs_f64() * 1000.0))
         .collect();
+    parts.push(format!("paths {}", stats.path_count));
+    parts.push(format!("palette {}", stats.palette_size));
     parts.join(", ")
 }
 
@@ -87,7 +90,12 @@ pub fn json_report(results: &[FileResult]) -> String {
                 }
                 let _ = write!(out, "\"{}\":{}", stage.as_str(), dur.as_micros());
             }
-            out.push_str("},\"error\":null");
+            out.push_str("},");
+            let _ = write!(
+                out,
+                "\"palette_size\":{},\"path_count\":{},\"error\":null",
+                stats.palette_size, stats.path_count
+            );
         } else {
             out.push_str(",\"error\":\"");
             push_json_escaped(&mut out, r.error.as_deref().unwrap_or("failed"));
@@ -174,7 +182,7 @@ mod tests {
     #[test]
     fn timing_line_lists_stages_in_order() {
         let line = timing_line(&stats());
-        assert_eq!(line, "decode 0.01ms, minify 0.02ms");
+        assert_eq!(line, "decode 0.01ms, minify 0.02ms, paths 2, palette 4");
     }
 
     #[test]
@@ -210,6 +218,30 @@ mod tests {
         assert!(json.contains("\"name\":\"b\\\"x.png\""));
         assert!(json.contains("\"error\":\"no\\tdice\""));
         assert!(json.ends_with("]}"));
+    }
+
+    /// The JSON report must carry the palette and path accounting the engine
+    /// already computes: `--json` consumers (CI size budgets, batch QA) need
+    /// them per file without re-parsing the SVG.
+    #[test]
+    fn json_report_includes_palette_and_path_counts() {
+        let results = vec![FileResult {
+            name: String::from("a.png"),
+            stats: Some(stats()),
+            error: None,
+        }];
+        let json = json_report(&results);
+        assert!(json.contains("\"palette_size\":4"));
+        assert!(json.contains("\"path_count\":2"));
+    }
+
+    /// The human `--stats` line shows the same accounting the README
+    /// documents ("10 paths, palette 6").
+    #[test]
+    fn timing_line_includes_palette_and_path_counts() {
+        let line = timing_line(&stats());
+        assert!(line.contains("paths 2"), "{line}");
+        assert!(line.contains("palette 4"), "{line}");
     }
 
     #[test]
