@@ -81,6 +81,65 @@ pub(crate) struct RankField {
     pub oy: f64,
 }
 
+/// Spatially constrained two-colour decomposition of an edge pixel.
+fn local_mixture(
+    i: usize,
+    lab: &[u16],
+    reg_rgb: &[Option<V3>],
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+) -> Option<(usize, usize, f32)> {
+    let none = u16::MAX;
+    let (x, y) = (i % w, i / w);
+    let mut votes: [(u16, u8); 6] = [(none, 0); 6];
+    let mut nv = 0_usize;
+    for yy in y.saturating_sub(2)..(y + 3).min(h) {
+        for xx in x.saturating_sub(2)..(x + 3).min(w) {
+            let l = lab[yy * w + xx];
+            if l == none {
+                continue;
+            }
+            if let Some(v) = votes[..nv].iter_mut().find(|v| v.0 == l) {
+                v.1 = v.1.saturating_add(1);
+            } else if nv < votes.len() {
+                votes[nv] = (l, 1);
+                nv += 1;
+            }
+        }
+    }
+    let own = lab[i];
+    let mut cands: [u16; 6] = [none; 6];
+    let mut nc = 0;
+    for &(l, c) in &votes[..nv] {
+        if c >= 2 || l == own {
+            cands[nc] = l;
+            nc += 1;
+        }
+    }
+    if nc == 1 {
+        return Some((own as usize, own as usize, 0.0));
+    }
+    let p = [
+        f32::from(pixels[i * 4]),
+        f32::from(pixels[i * 4 + 1]),
+        f32::from(pixels[i * 4 + 2]),
+    ];
+    let mut best: Option<(f32, usize, usize, f32)> = None;
+    for a in 0..nc {
+        let ca = reg_rgb[cands[a] as usize]?;
+        for b in a + 1..nc {
+            let cb = reg_rgb[cands[b] as usize]?;
+            let (d, t) = crate::color::model::seg_fit(p, ca, cb);
+            if best.is_none_or(|bst| d < bst.0) {
+                best = Some((d, cands[a] as usize, cands[b] as usize, t));
+            }
+        }
+    }
+    let (d, a, b, t) = best?;
+    (d < 28.0 * 28.0).then_some((a, b, t))
+}
+
 pub(crate) fn build_layers(
     uniques: &Uniques,
     pixels: &[u8],
@@ -119,6 +178,16 @@ pub(crate) fn build_layers(
         .collect::<std::vec::Vec<_>>();
     let mut px_later = vec![PxLater::default(); n_px];
 
+    let local_mix = settings.local_mixture;
+    let reg_rgb: std::vec::Vec<Option<V3>> = (0..regions.kinds.len())
+        .map(|r| match regions.kinds[r] {
+            RegionKind::Flat => {
+                let [r0, g0, b0] = oklab_to_rgb(pal[regions.flat_rank[r]]);
+                Some([f32::from(r0), f32::from(g0), f32::from(b0)])
+            }
+            _ => None,
+        })
+        .collect();
     for i in 0..n_px {
         let alpha = f32::from(pixels[i * 4 + 3]) / 255.0;
         if alpha == 0.0 || lab[i] == u16::MAX {
@@ -126,14 +195,22 @@ pub(crate) fn build_layers(
         }
         let uid = uniques.id[i] as usize;
         let dom0 = regions.band_to_region[dominant_rank(uid, mix)];
-        let (pa, pb, t) = if lab[i] == dom0 {
+        let (pa, pb, t) = if lab[i] != dom0 {
+            (lab[i] as usize, lab[i] as usize, 0.0)
+        } else if !local_mix {
             (
                 regions.band_to_region[mix.a[uid] as usize] as usize,
                 regions.band_to_region[mix.b[uid] as usize] as usize,
                 mix.t[uid],
             )
+        } else if let Some(m) = local_mixture(i, &lab, &reg_rgb, pixels, w, h) {
+            m
         } else {
-            (lab[i] as usize, lab[i] as usize, 0.0)
+            (
+                regions.band_to_region[mix.a[uid] as usize] as usize,
+                regions.band_to_region[mix.b[uid] as usize] as usize,
+                mix.t[uid],
+            )
         };
 
         let ua = unit_for_region(pa, i, &comp, &lab, w, h);
@@ -199,7 +276,8 @@ pub(crate) fn build_layers(
             let unit_idx = unit_of_rank[rank];
             let unit_px = f64::from(units[unit_idx].px);
             let unit_trap = if unit_px >= min_area { trap_r } else { 0 };
-            let field = build_rank_field_table(acc, &px_later, rank as u32, w, h, unit_trap);
+            let blur = if acc.cov.len() >= 96 { settings.field_blur as usize } else { 0 };
+            let field = build_rank_field_table(acc, &px_later, rank as u32, w, h, unit_trap, blur);
             let shapes = trace_rank_field(
                 &field,
                 w,
@@ -553,6 +631,7 @@ fn build_rank_field_table(
   w: usize,
   h: usize,
   trap_r: usize,
+  blur_passes: usize,
 ) -> RankField {
   let (bx0, by0, bx1, by1) = acc.bbox;
   debug_assert!(bx1 > bx0 && by1 > by0, "rank has own coverage");
@@ -625,6 +704,7 @@ fn build_rank_field_table(
           s.field[(y + 1) * spw + x + 1] = v;
         }
       }
+      blur_field(&mut s.field, spw, sph, blur_passes);
       RankField {
         field: std::mem::take(&mut s.field),
         spw,
@@ -1018,5 +1098,29 @@ mod tests {
       &mut sw,
     );
     assert!(out.layers.len() >= 3);
+  }
+}
+
+/// Separable [1 2 1]/4 binomial blur (σ≈0.71 px per pass), edges clamped.
+fn blur_field(f: &mut [f32], w: usize, h: usize, passes: usize) {
+  if passes == 0 || w < 3 || h < 3 {
+    return;
+  }
+  let mut tmp = vec![0.0_f32; f.len()];
+  for _ in 0..passes {
+    for y in 0..h {
+      let r = y * w;
+      for x in 0..w {
+        let l = f[r + x.saturating_sub(1)];
+        let rr = f[r + (x + 1).min(w - 1)];
+        tmp[r + x] = 0.25 * l + 0.5 * f[r + x] + 0.25 * rr;
+      }
+    }
+    for y in 0..h {
+      let (u, d) = (y.saturating_sub(1) * w, (y + 1).min(h - 1) * w);
+      for x in 0..w {
+        f[y * w + x] = 0.25 * tmp[u + x] + 0.5 * tmp[y * w + x] + 0.25 * tmp[d + x];
+      }
+    }
   }
 }
