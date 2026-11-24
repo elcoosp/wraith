@@ -95,7 +95,7 @@ pub(crate) fn build_layers(
 ) -> std::vec::Vec<ColorLayer> {
     let n_px = w * h;
     let min_px = (settings.min_area_px2.ceil() as u32).max(4);
-    let (lab, comp, units) = paint_units(uniques, mix, regions, pal, pixels, w, h, min_px);
+    let (lab, comp, units) = paint_units(uniques, mix, regions, pixels, w, h, min_px);
     let unit_count = units.len();
     if unit_count == 0 {
         sw.lap(Stage::Trace);
@@ -381,23 +381,7 @@ struct PaintUnit {
   px: u32,
   border: bool,
 }
-fn is_near_white_region(reg: u16, regions: &Regions, pal: &[V3]) -> bool {
-  let r = reg as usize;
-  if r >= regions.kinds.len() || regions.kinds[r] != RegionKind::Flat {
-    return false;
-  }
-  let [l, a, b] = pal[regions.flat_rank[r]];
-  l > 0.92 && (a * a + b * b) < 0.0016
-}
-
-fn absorb_small_components(
-  lab: &mut [u16],
-  regions: &Regions,
-  pal: &[V3],
-  w: usize,
-  h: usize,
-  min_px: u32,
-) {
+fn absorb_small_components(lab: &mut [u16], w: usize, h: usize, min_px: u32) {
   let n = w * h;
   let none = u16::MAX;
   let mut visited = vec![false; n];
@@ -429,12 +413,7 @@ fn absorb_small_components(
         }
       }
     }
-    let thr = if is_near_white_region(reg, regions, pal) {
-      min_px.max(((n as u32) / 14_000).min(72))
-    } else {
-      min_px
-    };
-    if (members.len() as u32) >= thr {
+    if (members.len() as u32) >= min_px {
       continue;
     }
     border_counts.clear();
@@ -467,7 +446,6 @@ fn paint_units(
   uniques: &Uniques,
   mix: &Mixture,
   regions: &Regions,
-  pal: &[V3],
   pixels: &[u8],
   w: usize,
   h: usize,
@@ -487,7 +465,7 @@ fn paint_units(
       }
   })
   .collect::<std::vec::Vec<_>>();
-  absorb_small_components(&mut lab, regions, pal, w, h, min_px);
+  absorb_small_components(&mut lab, w, h, min_px);
   let mut comp = vec![u32::MAX; n];
   let mut units = std::vec::Vec::new();
   let mut stack = std::vec::Vec::new();
@@ -638,44 +616,13 @@ fn build_rank_field_table(
           }
         }
       }
-      s.tmp.clear();
-      s.tmp.resize(bw * bh, 0.0);
+      s.field.clear();
+      s.field.resize(spw * sph, 0.0);
       for y in 0..bh {
         for x in 0..bw {
           let j = y * bw + x;
-          s.tmp[j] = (s.cov[j] + s.later[j] * s.maxf[j]).min(1.0);
-        }
-      }
-      s.field.clear();
-      s.field.resize(spw * sph, 0.0);
-      if bw >= 16 && bh >= 16 {
-        // 1-pass separable/4 binomial blur on regions >= 8x8 before contouring
-        // to eliminate pixel-grid stair-step wobble and cut SVG size ~40%.
-        s.cov.clear();
-        s.cov.resize(bw * bh, 0.0);
-        for y in 0..bh {
-          let row = y * bw;
-          for x in 0..bw {
-            let xm = x.saturating_sub(1);
-            let xp = (x + 1).min(bw - 1);
-            s.cov[row + x] =
-              0.25 * s.tmp[row + xm] + 0.5 * s.tmp[row + x] + 0.25 * s.tmp[row + xp];
-          }
-        }
-        for y in 0..bh {
-          let ym = y.saturating_sub(1) * bw;
-          let y0 = y * bw;
-          let yp = (y + 1).min(bh - 1) * bw;
-          for x in 0..bw {
-            let v = 0.25 * s.cov[ym + x] + 0.5 * s.cov[y0 + x] + 0.25 * s.cov[yp + x];
-            s.field[(y + 1) * spw + x + 1] = v;
-          }
-        }
-      } else {
-        for y in 0..bh {
-          for x in 0..bw {
-            s.field[(y + 1) * spw + x + 1] = s.tmp[y * bw + x];
-          }
+          let v = (s.cov[j] + s.later[j] * s.maxf[j]).min(1.0);
+          s.field[(y + 1) * spw + x + 1] = v;
         }
       }
       RankField {

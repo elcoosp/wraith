@@ -484,12 +484,127 @@ pub fn tls_line(pts: &[P]) -> (P, P, f64) {
     (c, d, dev)
 }
 
+/// Least-squares sagitta of `pts` about their TLS line: fits the signed
+/// residual `r(s) = α·s² + β·s + γ` against arc position `s` and returns
+/// `|α|·L²/4`, the bow a circular arc of that run would have. Straight but
+/// noisy edges have α≈0; arcs have a bow that grows with run length.
+fn bow(pts: &[P], c: P, d: P) -> f64 {
+    let [dx, dy] = d;
+    let nrm = [-dy, dx];
+    let m = pts.len() as f64;
+    let (mut s1, mut s2, mut s3, mut s4) = (0.0, 0.0, 0.0, 0.0);
+    let (mut r0, mut r1, mut r2) = (0.0, 0.0, 0.0);
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for p in pts {
+        let v = sub(*p, c);
+        let (s, r) = (dot(v, d), dot(v, nrm));
+        lo = lo.min(s);
+        hi = hi.max(s);
+        s1 += s;
+        s2 += s * s;
+        s3 += s * s * s;
+        s4 += s * s * s * s;
+        r0 += r;
+        r1 += r * s;
+        r2 += r * s * s;
+    }
+    let a = [[m, s1, s2], [s1, s2, s3], [s2, s3, s4]];
+    let det3 = |mat: [[f64; 3]; 3]| {
+        let [[m00, m01, m02], [m10, m11, m12], [m20, m21, m22]] = mat;
+        m00 * (m11 * m22 - m12 * m21)
+            - m01 * (m10 * m22 - m12 * m20)
+            + m02 * (m10 * m21 - m11 * m20)
+    };
+    let dd = det3(a);
+    if dd.abs() < 1e-12 {
+        return 0.0;
+    }
+    let ma = [[m, s1, r0], [s1, s2, r1], [s2, s3, r2]];
+    let alpha = det3(ma) / dd;
+    let l = hi - lo;
+    alpha.abs() * l * l / 4.0
+}
+
+/// Detects maximal straight runs of a ring and pins their end points as
+/// cuts, so [`fit_ring`] snaps each run to its TLS line and rebuilds the
+/// corners between runs as exact line intersections.
+pub(crate) fn snap_straight_runs(ring: &[P], cor: &mut [bool], line_tol: f64) -> Vec<bool> {
+    let n = ring.len();
+    let mut run_start = vec![false; n];
+    const MIN_LEN: f64 = 9.0;
+    if n < 12 {
+        return run_start;
+    }
+    let ok = |a: usize, len_pts: usize| -> bool {
+        let pts: Vec<P> = (0..=len_pts).map(|k| ring[(a + k) % n]).collect();
+        let (c, d, dev) = tls_line(&pts);
+        dev < line_tol && bow(&pts, c, d) < 0.45 * line_tol
+    };
+    let arc_len = |a: usize, len_pts: usize| -> f64 {
+        (0..len_pts)
+            .map(|k| len(sub(ring[(a + k + 1) % n], ring[(a + k) % n])))
+            .sum()
+    };
+    let start = cor.iter().position(|&c| c).unwrap_or(0);
+    let mut off = 0_usize;
+    while off + 3 < n {
+        let a = (start + off) % n;
+        let max_len = (n - 1 - off).min(n - 2);
+        let mut limit = max_len;
+        for k in 1..=max_len {
+            if cor[(a + k) % n] {
+                limit = k;
+                break;
+            }
+        }
+        if limit < 3 || !ok(a, 3) {
+            off += 1;
+            continue;
+        }
+        let (mut good, mut step) = (3_usize, 4_usize);
+        while good + step <= limit && ok(a, good + step) {
+            good += step;
+            step *= 2;
+        }
+        let (mut lo, mut hi) = (good, (good + step).min(limit + 1));
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if ok(a, mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let good = lo;
+        if arc_len(a, good) >= MIN_LEN {
+            cor[a] = true;
+            cor[(a + good) % n] = true;
+            run_start[a] = true;
+            off += good;
+        } else {
+            off += (good / 2).max(1);
+        }
+    }
+    run_start
+}
+
 /// Fits one closed ring into straight lines and cubic Bézier curves.
-///
-/// Cuts at corners (or two synthetic cuts when corner-free), snaps straight
-/// pieces to their TLS line, restores corners, and Schneider-fits curves.
 #[must_use]
 pub fn fit_ring(ring: &[P], corner: &[bool], tol: f64) -> (P, Vec<Seg>) {
+    fit_ring_ex(ring, corner, tol, &vec![false; ring.len()], tol)
+}
+
+/// [`fit_ring`] with forced-line pieces: a piece that starts at an index
+/// flagged in `run_start` snaps to its TLS line under `line_tol` instead of
+/// `tol`.
+#[must_use]
+pub(crate) fn fit_ring_ex(
+    ring: &[P],
+    corner: &[bool],
+    tol: f64,
+    run_start: &[bool],
+    line_tol: f64,
+) -> (P, Vec<Seg>) {
     let n = ring.len();
     let mut cuts: Vec<usize> = (0..n).filter(|&i| corner[i]).collect();
     let smooth_cut = cuts.is_empty();
@@ -516,13 +631,13 @@ pub fn fit_ring(ring: &[P], corner: &[bool], tol: f64) -> (P, Vec<Seg>) {
     // lines become the lines' intersection.
     let lines: Vec<Option<(P, P)>> = pieces
         .iter()
-        .map(|pc| {
+        .enumerate().map(|(ci, pc)| {
             if smooth_cut || pc.len() < 4 {
                 return None;
             }
             let (c, d, dev) = tls_line(pc);
             let chord = len(sub(pc[pc.len() - 1], pc[0]));
-            (chord >= 4.0 && dev < tol).then_some((c, d))
+            let lim = if run_start[cuts[ci]] { line_tol.max(tol) } else { tol }; (chord >= 4.0 && dev < lim).then_some((c, d))
         })
         .collect();
     let mut cpos: Vec<P> = cuts.iter().map(|&i| ring[i]).collect();
@@ -531,7 +646,7 @@ pub fn fit_ring(ring: &[P], corner: &[bool], tol: f64) -> (P, Vec<Seg>) {
             let (prev, next) = (lines[(ci + nc - 1) % nc], lines[ci]);
             if let (Some((c1, d1)), Some((c2, d2))) = (prev, next)
                 && let Some(x) = line_isect(c1, add(c1, d1), c2, add(c2, d2))
-                && len(sub(x, cpos[ci])) < 1.5
+                && len(sub(x, cpos[ci])) < 2.5
             {
                 cpos[ci] = x;
             }
@@ -567,113 +682,13 @@ pub fn fit_ring(ring: &[P], corner: &[bool], tol: f64) -> (P, Vec<Seg>) {
         } else {
             unit(sub(arc_pt(ring, e, -1, 1.5), ring[e]))
         };
-        fit_piece_with_straight_runs(piece, t1, t2, tol, &mut segs);
+        let mut cs = Vec::new();
+        fit_cubic(piece, t1, t2, tol * tol, &mut cs);
+        for c in cs {
+            segs.push(Seg::Cubic(c[1], c[2], c[3]));
+        }
     }
     (cpos[0], segs)
-}
-
-/// Checks whether `sub_pts` is a genuinely straight run rather than a shallow
-/// circular arc using a line-deviation bound and a quadratic-residual (sagitta)
-/// test: on a real arc, signed deviations from the chord all share one sign so
-/// `|mean_signed| / max_dev` approaches `2/3`, whereas on a straight line with
-/// marching-squares jitter, signed deviations oscillate around zero.
-fn is_straight_run(sub_pts: &[P], tol: f64) -> bool {
-    let m = sub_pts.len();
-    if m < 4 {
-        return false;
-    }
-    let a = sub_pts[0];
-    let b = sub_pts[m - 1];
-    let ab = sub(b, a);
-    let chord = len(ab);
-    if chord < 5.0 {
-        return false;
-    }
-    let inv_chord = 1.0 / chord;
-    let nx = -ab[1] * inv_chord;
-    let ny = ab[0] * inv_chord;
-    let dev_limit = (tol * 0.65).max(0.14);
-    let mut max_dev = 0.0_f64;
-    let mut signed_sum = 0.0_f64;
-    for p in &sub_pts[1..m - 1] {
-        let dx = p[0] - a[0];
-        let dy = p[1] - a[1];
-        let along = (dx * ab[0] + dy * ab[1]) * inv_chord;
-        if along < -0.25 || along > chord + 0.25 {
-            return false;
-        }
-        let sd = dx * nx + dy * ny;
-        let ad = sd.abs();
-        if ad > dev_limit {
-            return false;
-        }
-        if ad > max_dev {
-            max_dev = ad;
-        }
-        signed_sum += sd;
-    }
-    let mean_signed = (signed_sum / ((m - 2) as f64)).abs();
-    max_dev < 0.08 || mean_signed <= max_dev * 0.38
-}
-
-/// Splits an open piece into maximal straight runs (`Seg::Line`) and smooth
-/// curved runs (`fit_cubic` -> `Seg::Cubic`) with continuous tangents at joins.
-fn fit_piece_with_straight_runs(piece: &[P], t1: P, t2: P, tol: f64, segs: &mut Vec<Seg>) {
-    let n = piece.len();
-    let e2 = tol * tol;
-    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
-    let mut i = 0_usize;
-    let mut curve_start = 0_usize;
-
-    while i + 3 < n {
-        let mut best_j = None;
-        for j in (i + 3..n).rev() {
-            if is_straight_run(&piece[i..=j], tol) {
-                best_j = Some(j);
-                break;
-            }
-        }
-        if let Some(j) = best_j {
-            if i > curve_start {
-                runs.push((curve_start, i, false));
-            }
-            runs.push((i, j, true));
-            i = j;
-            curve_start = j;
-        } else {
-            i += 1;
-        }
-    }
-    if curve_start < n - 1 {
-        runs.push((curve_start, n - 1, false));
-    }
-
-    let rcount = runs.len();
-    for (idx, &(s, e, straight)) in runs.iter().enumerate() {
-        if straight {
-            segs.push(Seg::Line(piece[e]));
-        } else {
-            let st = if idx == 0 {
-                t1
-            } else if runs[idx - 1].2 {
-                unit(sub(piece[s], piece[runs[idx - 1].0]))
-            } else {
-                unit(sub(piece[(s + 1).min(e)], piece[s]))
-            };
-            let et = if idx + 1 == rcount {
-                t2
-            } else if runs[idx + 1].2 {
-                unit(sub(piece[e], piece[runs[idx + 1].1]))
-            } else {
-                unit(sub(piece[e.saturating_sub(1)], piece[e]))
-            };
-            let mut cs = Vec::new();
-            fit_cubic(&piece[s..=e], st, et, e2, &mut cs);
-            for c in cs {
-                segs.push(Seg::Cubic(c[1], c[2], c[3]));
-            }
-        }
-    }
 }
 
 /// Fits many rings in parallel (M2: rings are independent).
@@ -686,9 +701,11 @@ pub(crate) fn fit_rings_parallel(
     rings
         .par_iter()
         .map(|ring| {
-            let (mut ring2, cor) = find_corners(ring, corner_rad);
+            let (mut ring2, mut cor) = find_corners(ring, corner_rad);
+            let line_tol = (2.5 * tol).clamp(0.45, 0.9);
+            let run_start = snap_straight_runs(&ring2, &mut cor, line_tol);
             smooth_ring(&mut ring2, &cor, smooth);
-            fit_ring(&ring2, &cor, tol)
+            fit_ring_ex(&ring2, &cor, tol, &run_start, line_tol)
         })
         .collect()
 }
