@@ -193,11 +193,19 @@ pub fn trace_color(
     sw: &mut Stopwatch,
 ) -> ColorTrace {
     let (w, h) = (image.width, image.height);
+    let over_segmented = settings.gradients != Gradients::Off;
+
+    let filtered_buf;
+    let work_pixels: &[u8] = if !over_segmented && w >= 5 && h >= 5 {
+        filtered_buf = bilateral_denoise_rgba(&image.pixels, w, h);
+        &filtered_buf
+    } else {
+        &image.pixels
+    };
 
     // 1) unique colours + palette (over-segmented when gradient detection is
     // on, so ramps become chains of bands — roadmap M3 step 1)
-    let uniques = palette::unique_colors(&image.pixels, w);
-    let over_segmented = settings.gradients != Gradients::Off;
+    let uniques = palette::unique_colors(work_pixels, w);
     let pal = palette::build_palette(&uniques, w, h, settings, over_segmented);
     sw.lap(Stage::Palette);
 
@@ -207,11 +215,11 @@ pub fn trace_color(
     // 3) gradient region detection (M3)
     let regions = match settings.gradients {
         Gradients::Off => {
-            let counts = gradients::rank_pixel_counts(&uniques, &image.pixels, &mix);
+            let counts = gradients::rank_pixel_counts(&uniques, work_pixels, &mix);
             gradients::flat_regions(pal.len(), &counts)
         }
         Gradients::Linear | Gradients::LinearRadial => {
-            gradients::detect_regions(&uniques, &image.pixels, w, h, &pal, &mix, settings)
+            gradients::detect_regions(&uniques, work_pixels, w, h, &pal, &mix, settings)
         }
     };
 
@@ -220,7 +228,7 @@ pub fn trace_color(
     let background_rect = background == Background::None && !uniques.any_alpha;
     let layers = layers::build_layers(
         &uniques,
-        &image.pixels,
+        work_pixels,
         &pal,
         &mix,
         &regions,
@@ -230,15 +238,83 @@ pub fn trace_color(
         background_rect,
         sw,
     );
-
+    let palette_size = pal.len();
     ColorTrace {
         width: w,
         height: h,
         layers,
         gradients: regions.gradient_defs,
-        palette_size: pal.len(),
+        palette_size,
     }
 }
+
+/// Fast 2-pass edge-preserving bilateral filter (5×5 kernel, σ_color = 26)
+/// over opaque pixels (`alpha == 255`), leaving semi-transparent edge pixels
+/// untouched so sub-pixel AA coverage stays exact.
+fn bilateral_denoise_rgba(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut cur = src.to_vec();
+    let mut nxt = cur.clone();
+    const SPATIAL: [[f32; 5]; 5] = [
+        [0.3679, 0.5353, 0.6065, 0.5353, 0.3679],
+        [0.5353, 0.7788, 0.8825, 0.7788, 0.5353],
+        [0.6065, 0.8825, 1.0000, 0.8825, 0.6065],
+        [0.5353, 0.7788, 0.8825, 0.7788, 0.5353],
+        [0.3679, 0.5353, 0.6065, 0.5353, 0.3679],
+    ];
+    let mut range_lut = vec![0.0_f32; 3 * 255 * 255 + 1];
+    let inv_two_sig2 = -1.0_f32 / (2.0 * 26.0 * 26.0);
+    for (d2, val) in range_lut.iter_mut().enumerate() {
+        *val = ((d2 as f32) * inv_two_sig2).exp();
+    }
+    for _pass in 0..2 {
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                let idx = (row + x) * 4;
+                if cur[idx + 3] < 255 {
+                    continue;
+                }
+                let (r0, g0, b0) = (
+                    i32::from(cur[idx]),
+                    i32::from(cur[idx + 1]),
+                    i32::from(cur[idx + 2]),
+                );
+                let (mut sr, mut sg, mut sb, mut sw) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+                let y_lo = y.saturating_sub(2);
+                let y_hi = (y + 2).min(h - 1);
+                let x_lo = x.saturating_sub(2);
+                let x_hi = (x + 2).min(w - 1);
+                for ny in y_lo..=y_hi {
+                    let wy_idx = ny + 2 - y;
+                    let nrow = ny * w;
+                    for nx in x_lo..=x_hi {
+                        let nidx = (nrow + nx) * 4;
+                        if cur[nidx + 3] < 255 {
+                            continue;
+                        }
+                        let dr = i32::from(cur[nidx]) - r0;
+                        let dg = i32::from(cur[nidx + 1]) - g0;
+                        let db = i32::from(cur[nidx + 2]) - b0;
+                        let d2 = (dr * dr + dg * dg + db * db) as usize;
+                        let wgt = SPATIAL[wy_idx][nx + 2 - x] * range_lut[d2];
+                        sr += f32::from(cur[nidx]) * wgt;
+                        sg += f32::from(cur[nidx + 1]) * wgt;
+                        sb += f32::from(cur[nidx + 2]) * wgt;
+                        sw += wgt;
+                    }
+                }
+                if sw > 0.0 {
+                    nxt[idx] = (sr / sw).round().clamp(0.0, 255.0) as u8;
+                    nxt[idx + 1] = (sg / sw).round().clamp(0.0, 255.0) as u8;
+                    nxt[idx + 2] = (sb / sw).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        std::mem::swap(&mut cur, &mut nxt);
+    }
+    cur
+}
+
 
 #[cfg(test)]
 mod tests {
