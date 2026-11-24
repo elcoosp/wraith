@@ -187,6 +187,18 @@ pub struct ColorSettings {
     pub smooth_iters: u8,
     /// Speck filter: rings below this signed area (px²) are dropped.
     pub min_area_px2: f32,
+    /// Run the 2-pass bilateral denoise before palette construction.
+    /// Default off: it blends low-contrast facet edges and makes traced
+    /// edges 2-3x wobblier than the source (measured). Palette refinement and
+    /// small-component absorption already handle noise.
+    pub prefilter: bool,
+    /// Binomial blur passes on each coverage field before contouring
+    /// (0 = off, default 1). Removes sub-pixel contour noise without moving
+    /// straight edges.
+    pub field_blur: u8,
+    /// Decompose edge pixels using only colours present in their 5x5
+    /// neighbourhood (default on) instead of the global best-pair search.
+    pub local_mixture: bool,
 }
 
 impl Default for ColorSettings {
@@ -202,6 +214,9 @@ impl Default for ColorSettings {
             refine_iters: 0,
             smooth_iters: 2,
             min_area_px2: 2.0,
+            prefilter: false,
+            field_blur: 1,
+            local_mixture: true,
         }
     }
 }
@@ -234,6 +249,7 @@ impl ColorSettings {
         self.corner_angle_deg = self.corner_angle_deg.clamp(5.0, 85.0);
         self.trap_px = self.trap_px.clamp(0.0, 3.0);
         self.min_area_px2 = self.min_area_px2.clamp(0.0, 1_000.0);
+        self.field_blur = self.field_blur.min(3);
         self.smooth_iters = self.smooth_iters.min(64);
         if let Colors::Max(n) = &mut self.max_colors {
             *n = (*n).clamp(1, 64);
