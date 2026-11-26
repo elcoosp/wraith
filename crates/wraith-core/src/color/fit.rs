@@ -530,7 +530,7 @@ fn bow(pts: &[P], c: P, d: P) -> f64 {
 pub(crate) fn snap_straight_runs(ring: &[P], cor: &mut [bool], line_tol: f64) -> Vec<bool> {
     let n = ring.len();
     let mut run_start = vec![false; n];
-    const MIN_LEN: f64 = 15.0;
+    const MIN_LEN: f64 = 8.5;
     if n < 12 {
         return run_start;
     }
@@ -706,10 +706,16 @@ pub(crate) fn fit_rings_parallel(
     rings
         .par_iter()
         .map(|ring| {
-            let (mut ring2, mut cor) = find_corners(ring, corner_rad);
-            let line_tol = (2.5 * tol).clamp(0.45, 0.9);
-            let run_start = snap_straight_runs(&ring2, &mut cor, line_tol);
+            let mut pre = ring.clone();
+            if smooth > 0 {
+                let no_cor = vec![false; pre.len()];
+                smooth_ring(&mut pre, &no_cor, smooth.min(3));
+            }
+            let eff_corner = if smooth >= 5 { corner_rad.max(1.05) } else { corner_rad };
+            let (mut ring2, mut cor) = find_corners(&pre, eff_corner);
+            let line_tol = (3.0 * tol).clamp(0.6, 1.2);
             smooth_ring(&mut ring2, &cor, smooth);
+            let run_start = snap_straight_runs(&ring2, &mut cor, line_tol);
             fit_ring_ex(&ring2, &cor, tol, &run_start, line_tol)
         })
         .collect()

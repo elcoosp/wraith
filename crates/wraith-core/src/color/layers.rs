@@ -241,17 +241,17 @@ fn build_layers_supersampled(_lab: &[u16], regions: &Regions, region_fills: &[[u
             let r = (f32::from(pixels[i00]) * w00 + f32::from(pixels[i10]) * w10 + f32::from(pixels[i01]) * w01 + f32::from(pixels[i11]) * w11).round() as u8;
             let g = (f32::from(pixels[i00 + 1]) * w00 + f32::from(pixels[i10 + 1]) * w10 + f32::from(pixels[i01 + 1]) * w01 + f32::from(pixels[i11 + 1]) * w11).round() as u8;
             let b = (f32::from(pixels[i00 + 2]) * w00 + f32::from(pixels[i10 + 2]) * w10 + f32::from(pixels[i01 + 2]) * w01 + f32::from(pixels[i11 + 2]) * w11).round() as u8;
-            let okl = rgb_to_oklab([r, g, b]); let px_gray = (okl[1] * okl[1] + okl[2] * okl[2]) < 0.0020;
+            let okl = rgb_to_oklab([r, g, b]);
+            let cands = [_lab[y0 * w + x0], _lab[y0 * w + x1], _lab[y1 * w + x0], _lab[y1 * w + x1]];
             let mut best_r = 0_u16; let mut best_d = f32::MAX;
-            for (ri, opt) in reg_oklab.iter().enumerate() { if let Some(rc) = opt { let rc_chroma = (rc[1]*rc[1] + rc[2]*rc[2]) > 0.0049; if px_gray && rc_chroma { continue; } let d = crate::color::palette::d2(okl, *rc); if d < best_d { best_d = d; best_r = ri as u16; } } }
+            for ri in 0..n_reg { if !is_top_ink[ri] && !cands.contains(&(ri as u16)) { continue; } if let Some(rc) = reg_oklab[ri] { let d = crate::color::palette::d2(okl, rc); if d < best_d { best_d = d; best_r = ri as u16; } } }
             sub_lab[sy * sw_w + sx] = best_r;
         }
     }
-    sever_label_bridges(&mut sub_lab, &reg_oklab, sw_w, sw_h, settings.denoise.sever_noise_bridges);
+    if settings.linework != LineworkPolicy::TopInkOverlay { sever_label_bridges(&mut sub_lab, &reg_oklab, sw_w, sw_h, settings.denoise.sever_noise_bridges); }
     let min_px_sub = ((settings.min_area_px2.ceil() as u32).max(4)) * ((scale * scale) as u32);
     absorb_small_components(&mut sub_lab, &reg_oklab, sw_w, sw_h, min_px_sub, settings.denoise);
-    for _ in 0..2 { let prev = sub_lab.clone(); for sy in 1..(sw_h - 1) { let row = sy * sw_w; for sx in 1..(sw_w - 1) { let idx = row + sx; let c = prev[idx]; if c == none || (c as usize) >= n_reg || is_top_ink[c as usize] { continue; } let nbs = [prev[idx-1], prev[idx+1], prev[idx-sw_w], prev[idx+sw_w], prev[idx-sw_w-1], prev[idx-sw_w+1], prev[idx+sw_w-1], prev[idx+sw_w+1]]; let mut best = c; let mut best_c = 0_u8; for &nb in &nbs { if nb != none && (nb as usize) < n_reg && !is_top_ink[nb as usize] { let cnt = nbs.iter().filter(|&&v| v == nb).count() as u8; if cnt > best_c { best_c = cnt; best = nb; } } } if best_c >= 5 { sub_lab[idx] = best; } } } }
-    if settings.linework == LineworkPolicy::TopInkOverlay { let mut vis = vec![false; sw_w * sw_h]; let mut st = std::vec::Vec::new(); let mut mem = std::vec::Vec::new(); for start in 0..(sw_w * sw_h) { let reg = sub_lab[start]; if reg == none || (reg as usize) >= n_reg || is_top_ink[reg as usize] || vis[start] { continue; } vis[start] = true; st.push(start); mem.clear(); let mut ink_border = 0_u32; let mut best_nb = none; let mut best_cnt = 0_u32; let mut nb_counts: std::vec::Vec<(u16, u32)> = std::vec::Vec::new(); while let Some(p) = st.pop() { mem.push(p); let (px, py) = (p % sw_w, p / sw_w); for &(dx, dy) in &[(1_usize,0),(usize::MAX,0),(0,1),(0,usize::MAX)] { let (nx, ny) = (px.wrapping_add(dx), py.wrapping_add(dy)); if nx < sw_w && ny < sw_h { let nreg = sub_lab[ny * sw_w + nx]; if nreg == reg { if !vis[ny * sw_w + nx] { vis[ny * sw_w + nx] = true; st.push(ny * sw_w + nx); } } else if nreg != none && (nreg as usize) < n_reg { if is_top_ink[nreg as usize] { ink_border += 1; } else { if let Some((_, c)) = nb_counts.iter_mut().find(|(r, _)| *r == nreg) { *c += 1; } else { nb_counts.push((nreg, 1)); } } } } } } for &(nr, cnt) in &nb_counts { if cnt > best_cnt { best_cnt = cnt; best_nb = nr; } } let total_b = ink_border + best_cnt; if ink_border > 0 && best_nb != none && (mem.len() < 180 || (mem.len() < 380 && ink_border * 100 >= total_b * 45)) { for &p in &mem { sub_lab[p] = best_nb; } } } }
+    if settings.linework == LineworkPolicy::TopInkOverlay { let mut vis = vec![false; sw_w * sw_h]; let mut st = std::vec::Vec::new(); let mut mem = std::vec::Vec::new(); for start in 0..(sw_w * sw_h) { let reg = sub_lab[start]; if reg == none || (reg as usize) >= n_reg || is_top_ink[reg as usize] || vis[start] { continue; } vis[start] = true; st.push(start); mem.clear(); let mut ink_border = 0_u32; let mut best_nb = none; let mut best_cnt = 0_u32; let mut nb_counts: std::vec::Vec<(u16, u32)> = std::vec::Vec::new(); while let Some(p) = st.pop() { mem.push(p); let (px, py) = (p % sw_w, p / sw_w); for &(dx, dy) in &[(1_usize,0),(usize::MAX,0),(0,1),(0,usize::MAX)] { let (nx, ny) = (px.wrapping_add(dx), py.wrapping_add(dy)); if nx < sw_w && ny < sw_h { let nreg = sub_lab[ny * sw_w + nx]; if nreg == reg { if !vis[ny * sw_w + nx] { vis[ny * sw_w + nx] = true; st.push(ny * sw_w + nx); } } else if nreg != none && (nreg as usize) < n_reg { if is_top_ink[nreg as usize] { ink_border += 1; } else { if let Some((_, c)) = nb_counts.iter_mut().find(|(r, _)| *r == nreg) { *c += 1; } else { nb_counts.push((nreg, 1)); } } } } } } for &(nr, cnt) in &nb_counts { if cnt > best_cnt { best_cnt = cnt; best_nb = nr; } } let total_b = ink_border + best_cnt; let is_light = reg_oklab[reg as usize].is_some_and(|[l, _, _]| l > 0.88); if ink_border > 0 && best_nb == none && mem.len() < 360 && is_light { for &p in &mem { sub_lab[p] = none; } } else if ink_border > 0 && best_nb != none && (mem.len() < 240 || (mem.len() < 460 && (ink_border * 100 >= total_b * 35 || (total_b as usize * total_b as usize) > mem.len() * 22))) { for &p in &mem { sub_lab[p] = best_nb; } } } }
     let mut reg_px = vec![0_u32; n_reg]; for &l in &sub_lab { if l != none && (l as usize) < n_reg { reg_px[l as usize] += 1; } }
     let mut reg_order: std::vec::Vec<usize> = (0..n_reg).filter(|&r| reg_px[r] > 0).collect(); reg_order.sort_by(|&a, &b| is_top_ink[a].cmp(&is_top_ink[b]).then_with(|| reg_px[b].cmp(&reg_px[a])));
     let mut fill_lab = sub_lab.clone(); if settings.linework == LineworkPolicy::TopInkOverlay { for _ in 0..5 { let prev = fill_lab.clone(); for sy in 1..(sw_h - 1) { let row = sy * sw_w; for sx in 1..(sw_w - 1) { let idx = row + sx; let cur = prev[idx]; if cur != none && (cur as usize) < n_reg && is_top_ink[cur as usize] { let mut best_nb = none; let mut best_sz = 0_u32; for &(dx, dy) in &[(-1_isize,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)] { let nb = prev[((sy as isize + dy) as usize) * sw_w + ((sx as isize + dx) as usize)]; if nb != none && (nb as usize) < n_reg && !is_top_ink[nb as usize] && reg_px[nb as usize] > best_sz { best_sz = reg_px[nb as usize]; best_nb = nb; } } if best_nb != none { fill_lab[idx] = best_nb; } } } } } }
@@ -261,17 +261,47 @@ fn build_layers_supersampled(_lab: &[u16], regions: &Regions, region_fills: &[[u
         let (bx0, by0, bx1, by1) = bboxes[reg]; if bx1 <= bx0 || by1 <= by0 { return None; }
         if order_idx == 0 && background_rect && regions.kinds[reg] == RegionKind::Flat { return Some(ColorLayer { paint: Paint::Solid(region_fills[reg]), shapes: vec![Shape::Rect { x: 0.0, y: 0.0, w: w as f64, h: h as f64, r: 0.0 }] }); }
         let is_white = reg_oklab[reg].is_some_and(|[l, a, b]| l > 0.92 && (a * a + b * b) < 0.0025);
-        let bleed = if is_top_ink[reg] || settings.trap_px <= 0.0 { 0_usize } else { 2_usize };
+        let bleed = if is_top_ink[reg] || is_white || settings.trap_px <= 0.0 { 0_usize } else { 2_usize };
         let pad = bleed + 2; let x0 = bx0.saturating_sub(pad); let y0 = by0.saturating_sub(pad); let x1 = (bx1 + pad).min(sw_w); let y1 = (by1 + pad).min(sw_h); let bw = x1 - x0; let bh = y1 - y0; let (spw, sph) = (bw + 2, bh + 2);
         let target = reg as u16; let src_grid = if is_top_ink[reg] { &sub_lab } else { &fill_lab }; let mut mask = vec![0.0_f32; bw * bh];
-        for y in 0..bh { let srow = (y + y0) * sw_w; let drow = y * bw; for x in 0..bw { if src_grid[srow + x + x0] == target { mask[drow + x] = 1.0; } } }
+        for y in 0..bh { let srow = (y + y0) * sw_w; let drow = y * bw; for x in 0..bw {
+            if is_top_ink[reg] {
+                if is_top_ink[reg] {
+                    let fx = ((x + x0) as f32 + 0.5) / (scale as f32) - 0.5; let fy = ((y + y0) as f32 + 0.5) / (scale as f32) - 0.5;
+                    let ix = (fx.floor().max(0.0) as usize).min(w - 1); let iy = (fy.floor().max(0.0) as usize).min(h - 1);
+                    let ix1 = (ix + 1).min(w - 1); let iy1 = (iy + 1).min(h - 1);
+                    let wx = (fx - ix as f32).clamp(0.0, 1.0); let wy = (fy - iy as f32).clamp(0.0, 1.0);
+                    let lum = |px: usize, py: usize| { let i = (py * w + px) * 4; (0.2126 * f32::from(pixels[i]) + 0.7152 * f32::from(pixels[i+1]) + 0.0722 * f32::from(pixels[i+2])) / 255.0 };
+                    let l = lum(ix, iy)*(1.0-wx)*(1.0-wy) + lum(ix1, iy)*wx*(1.0-wy) + lum(ix, iy1)*(1.0-wx)*wy + lum(ix1, iy1)*wx*wy;
+                    mask[drow + x] = ((0.31 - l) / 0.12).clamp(0.0, 1.0);
+                }
+            } else if src_grid[srow + x + x0] == target { mask[drow + x] = 1.0; }
+        } }
         for _ in 0..bleed { let mut dilated = mask.clone(); for y in 1..(bh - 1) { let row = y * bw; for x in 1..(bw - 1) { if mask[row + x] > 0.5 || mask[row + x - 1] > 0.5 || mask[row + x + 1] > 0.5 || mask[row - bw + x] > 0.5 || mask[row + bw + x] > 0.5 { dilated[row + x] = 1.0; } } } mask = dilated; }
         if is_white && bw >= 3 && bh >= 3 { let mut vis = vec![false; bw * bh]; let mut st = std::vec::Vec::new(); let mut mem = std::vec::Vec::new(); for idx in 0..(bw * bh) { if mask[idx] < 0.5 || vis[idx] { continue; } vis[idx] = true; st.push(idx); mem.clear(); let mut perim = 0_usize; while let Some(p) = st.pop() { mem.push(p); let (px, py) = (p % bw, p / bw); for &(dx, dy) in &[(1_usize,0),(usize::MAX,0),(0,1),(0,usize::MAX)] { let (nx, ny) = (px.wrapping_add(dx), py.wrapping_add(dy)); if nx >= bw || ny >= bh || mask[ny*bw+nx] < 0.5 { perim += 1; } else if !vis[ny*bw+nx] { vis[ny*bw+nx] = true; st.push(ny*bw+nx); } } } if mem.len() < 80 || (perim * perim) > mem.len() * 28 { for &p in &mem { mask[p] = 0.0; } } } }
+        if is_top_ink[reg] && bw >= 5 && bh >= 5 {
+            let mut er = vec![0.0_f32; bw * bh];
+            for y in 1..(bh - 1) { let r = y * bw; for x in 1..(bw - 1) {
+                er[r+x] = mask[r+x].min(mask[r+x-1]).min(mask[r+x+1]).min(mask[r-bw+x]).min(mask[r+bw+x]);
+            } }
+            for y in 1..(bh - 1) { let r = y * bw; for x in 1..(bw - 1) {
+                mask[r+x] = er[r+x].max(er[r+x-1]).max(er[r+x+1]).max(er[r-bw+x]).max(er[r+bw+x]);
+            } }
+        }
+        if is_top_ink[reg] && bw >= 5 && bh >= 5 {
+            let mut er = vec![0.0_f32; bw * bh];
+            for y in 1..(bh - 1) { let r = y * bw; for x in 1..(bw - 1) {
+                er[r+x] = mask[r+x].min(mask[r+x-1]).min(mask[r+x+1]).min(mask[r-bw+x]).min(mask[r+bw+x]);
+            } }
+            for y in 1..(bh - 1) { let r = y * bw; for x in 1..(bw - 1) {
+                mask[r+x] = er[r+x].max(er[r+x-1]).max(er[r+x+1]).max(er[r-bw+x]).max(er[r+bw+x]);
+            } }
+        }
         let mut field = vec![0.0_f32; spw * sph]; for y in 0..bh { let drow = (y + 1) * spw + 1; let srow = y * bw; field[drow..(drow + bw)].copy_from_slice(&mask[srow..(srow + bw)]); } blur_field(&mut field, spw, sph, if is_top_ink[reg] { 5 } else { 3 });
         let mut nxt = std::vec::Vec::new();
 let raw_rings = contour::contours_with(&field, spw, sph, &mut nxt, &[TileSpan { x0: 0, x1: spw.div_ceil(contour::TILE), y0: 0, y1: sph.div_ceil(contour::TILE) }]).into_iter().map(|ring| ring.into_iter().map(|[px, py]| [((px + x0 as f64) * inv_scale).clamp(0.0, w as f64), ((py + y0 as f64) * inv_scale).clamp(0.0, h as f64)]).collect::<std::vec::Vec<_>>()).filter(|r| fit::area(&dedupe_ring(r)).abs() >= min_area).collect::<std::vec::Vec<_>>();
 if raw_rings.is_empty() { return None; }
-let reg_smooth = if is_top_ink[reg] { smooth + 4 } else { smooth }; let fitted = fit::fit_rings_parallel(&raw_rings, tol, corner_rad, reg_smooth);
+let fitted = fit::fit_rings_parallel(&raw_rings, tol, corner_rad, smooth);
 let shapes: std::vec::Vec<Shape> = fitted.into_iter().filter(|(_, segs)| !segs.is_empty()).map(|(start, segs)| Shape::Path { start, segs: to_path_segs(&segs) }).collect();
 (!shapes.is_empty()).then(|| ColorLayer { paint: match regions.kinds[reg] { RegionKind::Gradient(idx) => Paint::Gradient(idx), RegionKind::Flat => Paint::Solid(region_fills[reg]) }, shapes })
 }).collect();
