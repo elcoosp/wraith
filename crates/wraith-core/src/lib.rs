@@ -37,7 +37,8 @@ pub mod trace;
 pub use error::{Result, WraithError};
 pub use pipeline::{Output, convert};
 pub use settings::{
-    Background, ColorSettings, Colors, ContentPreset, Engine, Gradients, LegacyColorSettings,
+    Background, ColorSettings, Colors, ContentPreset, DenoiseSettings, Engine, Gradients,
+    LegacyColorSettings, LineworkPolicy,
     LegacyHierarchy, Minify, Mode, Quality, Settings,
 };
 pub use stats::{ConvertStats, Stage, Stopwatch};

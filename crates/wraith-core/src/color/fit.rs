@@ -245,7 +245,7 @@ pub fn find_corners(dense: &[P], corner_rad: f64) -> (Vec<P>, Vec<bool>) {
         let start = usize::from(skip_first[j]);
         let is_corner = !used[j] && {
             let (a, b, c) = (v[(j + m - 1) % m], v[j], v[(j + 1) % m]);
-            len(sub(b, a)) >= 2.0 && len(sub(c, b)) >= 2.0 && turn(a, b, c) >= flag_rad
+            len(sub(b, a)) >= 3.8 && len(sub(c, b)) >= 3.8 && turn(a, b, c) >= flag_rad
         };
         for (k, p) in chunk.iter().enumerate().skip(start) {
             out.push(*p);
@@ -530,7 +530,7 @@ fn bow(pts: &[P], c: P, d: P) -> f64 {
 pub(crate) fn snap_straight_runs(ring: &[P], cor: &mut [bool], line_tol: f64) -> Vec<bool> {
     let n = ring.len();
     let mut run_start = vec![false; n];
-    const MIN_LEN: f64 = 9.0;
+    const MIN_LEN: f64 = 15.0;
     if n < 12 {
         return run_start;
     }

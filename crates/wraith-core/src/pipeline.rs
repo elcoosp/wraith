@@ -45,7 +45,7 @@ pub fn convert(png: &[u8], settings: &Settings) -> Result<Output> {
             &mut sw,
         );
         let dims = (traced.width, traced.height);
-        let canonical = color::write::write_svg(&traced);
+        let canonical = color::write::write_svg_with_options(&traced, settings.color.trim_viewbox);
         // The stopwatch chains from the trace lap (see `Stopwatch::lap`), so
         // serialization is timed without an explicit restart.
         sw.lap(Stage::Serialize);

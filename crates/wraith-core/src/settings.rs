@@ -160,6 +160,39 @@ pub enum ContentPreset {
     Icon,
     /// Dense illustration: larger palette for detail-heavy art.
     Illustration,
+    /// Cel-shaded / faceted illustration: flattens blotches & keeps dark ink on top.
+    CelArt,
+}
+
+/// Interior texture/compression blotch cleanup knobs for the geometric engine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DenoiseSettings {
+    /// Maximum interior region area (fraction of opaque foreground pixels) for blotch absorption.
+    pub max_blotch_fraction: f32,
+    /// Maximum Oklab distance between a blotch and its dominant neighbor to merge.
+    pub blotch_oklab_threshold: f32,
+    /// Radius (px) for separable morphological opening on fill masks (`0` = off, `1` = 3x3).
+    pub sever_noise_bridges: u8,
+}
+
+impl Default for DenoiseSettings {
+    fn default() -> Self {
+        Self {
+            max_blotch_fraction: 0.0015,
+            blotch_oklab_threshold: 0.075,
+            sever_noise_bridges: 0,
+        }
+    }
+}
+
+/// Ink / dark linework compositing order in the geometric engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineworkPolicy {
+    /// Standard area-sorted painter's order (largest regions first).
+    #[default]
+    AreaSorted,
+    /// Composite dark high-contrast outline/ink regions above adjacent color fills.
+    TopInkOverlay,
 }
 
 /// Knobs of the geometric colour engine (roadmap M7 sketch). Every value has
@@ -206,6 +239,14 @@ pub struct ColorSettings {
     /// roughly halving the boundary error. Crisp 1-px edges are skipped by
     /// the width gate.
     pub edge_bands: bool,
+    /// Interior compression/texture blotch cleanup settings.
+    pub denoise: DenoiseSettings,
+    /// Ink / dark outline compositing policy.
+    pub linework: LineworkPolicy,
+    /// Crop the emitted SVG `viewBox` tightly to non-transparent geometry bounds.
+    pub trim_viewbox: bool,
+    /// Supersampling factor (1..=3) for discrete-label contour extraction (`2` in `CelArt`).
+    pub supersample: u8,
 }
 
 impl Default for ColorSettings {
@@ -225,6 +266,10 @@ impl Default for ColorSettings {
             field_blur: 1,
             local_mixture: true,
             edge_bands: true,
+            denoise: DenoiseSettings::default(),
+            linework: LineworkPolicy::default(),
+            trim_viewbox: false,
+            supersample: 1,
         }
     }
 }
@@ -244,6 +289,23 @@ impl ColorSettings {
             ContentPreset::Illustration => {
                 self.max_colors = Colors::Max(64);
             }
+            ContentPreset::CelArt => {
+                self.prefilter = true;
+                self.gradients = Gradients::Off;
+                self.linework = LineworkPolicy::TopInkOverlay;
+                self.supersample = 2;
+                self.max_colors = Colors::Max(10);
+                self.merge_distance = 0.048;
+                self.min_area_px2 = 20.0;
+                self.tolerance_px = 0.55;
+                self.corner_angle_deg = 45.0;
+                self.smooth_iters = 7;
+                self.denoise = DenoiseSettings {
+                    max_blotch_fraction: 0.012,
+                    blotch_oklab_threshold: 0.055,
+                    sever_noise_bridges: 1,
+                };
+            }
         }
         self
     }
@@ -259,6 +321,10 @@ impl ColorSettings {
         self.min_area_px2 = self.min_area_px2.clamp(0.0, 1_000.0);
         self.field_blur = self.field_blur.min(3);
         self.smooth_iters = self.smooth_iters.min(64);
+        self.denoise.max_blotch_fraction = self.denoise.max_blotch_fraction.clamp(0.0, 0.05);
+        self.denoise.blotch_oklab_threshold = self.denoise.blotch_oklab_threshold.clamp(0.0, 0.5);
+        self.denoise.sever_noise_bridges = self.denoise.sever_noise_bridges.min(2);
+        self.supersample = self.supersample.clamp(1, 3);
         if let Colors::Max(n) = &mut self.max_colors {
             *n = (*n).clamp(1, 64);
         }

@@ -77,6 +77,8 @@ pub enum PresetArg {
     Icon,
     /// Dense illustration: larger palette for detail-heavy art.
     Illustration,
+    /// Cel-shaded / faceted illustration: flattens blotches & keeps dark ink on top.
+    CelArt,
 }
 
 /// Gradient fitting level mirrored from [`wraith_core::Gradients`].
@@ -282,6 +284,22 @@ pub struct Cli {
     #[arg(long)]
     pub no_primitives: bool,
 
+    /// Crop the emitted SVG `viewBox` tightly to non-transparent geometry bounds.
+    #[arg(long)]
+    pub trim: bool,
+
+    /// Maximum interior blotch area (fraction of foreground pixels) to flatten.
+    #[arg(long, value_name = "FRAC")]
+    pub blotch_fraction: Option<f32>,
+
+    /// Morphological opening radius (0-2 px) to sever thin noise bridges before blotch cleanup.
+    #[arg(long, value_name = "PX")]
+    pub sever_bridges: Option<u8>,
+
+    /// Supersampling factor (1-3) for discrete-region geometric tracing.
+    #[arg(long, value_name = "N")]
+    pub supersample: Option<u8>,
+
     /// Field-driven refinement iterations for the geometric engine
     /// (0 = off, default 0).
     #[arg(
@@ -390,6 +408,7 @@ impl Cli {
             PresetArg::Logo => wraith_core::ContentPreset::Logo,
             PresetArg::Icon => wraith_core::ContentPreset::Icon,
             PresetArg::Illustration => wraith_core::ContentPreset::Illustration,
+            PresetArg::CelArt => wraith_core::ContentPreset::CelArt,
         });
         s.color.max_colors = match self.colors {
             ColorsArg::Auto => wraith_core::Colors::Auto,
@@ -425,6 +444,18 @@ impl Cli {
             };
         }
         s.color.primitives = !self.no_primitives;
+        if self.trim {
+            s.color.trim_viewbox = true;
+        }
+        if let Some(v) = self.blotch_fraction {
+            s.color.denoise.max_blotch_fraction = v;
+        }
+        if let Some(v) = self.sever_bridges {
+            s.color.denoise.sever_noise_bridges = v;
+        }
+        if let Some(v) = self.supersample {
+            s.color.supersample = v;
+        }
         s.color.refine_iters = self.refine;
         s.color.smooth_iters = self.smooth;
         s.legacy_color = wraith_core::LegacyColorSettings {

@@ -117,14 +117,72 @@ fn fill_attr(paint: &Paint) -> String {
     }
 }
 
+/// Computes tight geometry bounding box `(min_x, min_y, max_x, max_y)`.
+fn trace_bounds(trace: &ColorTrace) -> Option<(f64, f64, f64, f64)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut any = false;
+    let mut pt = |p: [f64; 2]| {
+        any = true;
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    };
+    for layer in &trace.layers {
+        for shape in &layer.shapes {
+            match shape {
+                Shape::Path { start, segs } => {
+                    pt(*start);
+                    for seg in segs {
+                        match seg {
+                            PathSeg::Line { p } | PathSeg::Arc { p, .. } => pt(*p),
+                            PathSeg::Cubic { c1, c2, p } => {
+                                pt(*c1);
+                                pt(*c2);
+                                pt(*p);
+                            }
+                        }
+                    }
+                }
+                Shape::Circle { cx, cy, r } => {
+                    pt([cx - r, cy - r]);
+                    pt([cx + r, cy + r]);
+                }
+                Shape::Ellipse { cx, cy, rx, ry } => {
+                    pt([cx - rx, cy - ry]);
+                    pt([cx + rx, cy + ry]);
+                }
+                Shape::Rect { x, y, w, h, .. } => {
+                    pt([*x, *y]);
+                    pt([x + w, y + h]);
+                }
+            }
+        }
+    }
+    any.then_some((x0.floor().max(0.0), y0.floor().max(0.0), x1.ceil(), y1.ceil()))
+}
+
 /// Serializes the geometric trace into a minimal SVG document.
 #[must_use]
 pub fn write_svg(trace: &ColorTrace) -> String {
+    write_svg_with_options(trace, false)
+}
+
+/// Serializes the geometric trace, optionally trimming `viewBox` to tight geometry bounds.
+#[must_use]
+pub fn write_svg_with_options(trace: &ColorTrace, trim_viewbox: bool) -> String {
     let mut out = String::with_capacity(4096);
+    let (vx, vy, vw, vh) = if trim_viewbox {
+        trace_bounds(trace).map_or((0.0, 0.0, trace.width as f64, trace.height as f64), |(x0, y0, x1, y1)| {
+            (x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0))
+        })
+    } else {
+        (0.0, 0.0, trace.width as f64, trace.height as f64)
+    };
     let _ = write!(
         out,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">",
-        trace.width, trace.height, trace.width, trace.height
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\">",
+        num(vw), num(vh), num(vx), num(vy), num(vw), num(vh)
     );
     if !trace.gradients.is_empty() {
         out.push_str("<defs>");

@@ -239,7 +239,10 @@ fn merge_close(pal: &mut Vec<V3>, cnt: &mut Vec<f64>, thr: f32) {
             for j in i + 1..pal.len() {
                 let pi = pal.get(i).copied().unwrap_or_default();
                 let pj = pal.get(j).copied().unwrap_or_default();
-                let eff_thr = if is_neutral_highlight(pi) && is_neutral_highlight(pj) {
+                let [li, ai, bi] = pi; let [lj, aj, bj] = pj;
+                let w_i = li > 0.94 && (ai * ai + bi * bi) < 0.0009;
+                let w_j = lj > 0.94 && (aj * aj + bj * bj) < 0.0009;
+                let eff_thr = if w_i != w_j { 0.0 } else if is_neutral_highlight(pi) && is_neutral_highlight(pj) {
                     thr * 0.45
                 } else {
                     thr
@@ -359,6 +362,8 @@ pub fn build_palette(
     } else {
         merge_close(&mut pal, &mut cnt0, settings.merge_distance);
     }
+    let pure_white_px: f32 = uniques.colors.iter().zip(&uniques.count).filter(|&(&[r, g, b], _)| r >= 245 && g >= 245 && b >= 245).map(|(_, &c)| c).sum();
+    if pure_white_px >= 64.0 && !pal.iter().any(|&[l, a, b]| l > 0.95 && (a * a + b * b) < 0.0009) { pal.push([1.0, 0.0, 0.0]); }
     prune_ghosts(&mut pal, uniques, w, h);
 
     // Interior-median refinement is a non-over-segmented tool only: measured
@@ -391,7 +396,12 @@ pub fn build_palette(
             .partial_cmp(&cnt[x])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    order.iter().map(|&i| pal[i]).collect()
+    let mut out_pal: Vec<V3> = order.iter().map(|&i| pal[i]).collect();
+    let pure_white_px: f32 = uniques.colors.iter().zip(&uniques.count).filter(|&(&[r, g, b], _)| r >= 245 && g >= 245 && b >= 245).map(|(_, &c)| c).sum();
+    if pure_white_px >= 64.0 && !out_pal.iter().any(|&[l, a, b]| l > 0.96 && (a * a + b * b) < 0.0004) {
+        if let Some(last) = out_pal.last_mut() { *last = [1.0, 0.0, 0.0]; }
+    }
+    out_pal
 }
 
 fn refine_interior_medians(pal: &mut [V3], uniques: &Uniques, w: usize, h: usize) -> f32 {
