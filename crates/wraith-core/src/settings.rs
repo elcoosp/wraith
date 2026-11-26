@@ -294,15 +294,15 @@ impl ColorSettings {
                 self.gradients = Gradients::Off;
                 self.linework = LineworkPolicy::TopInkOverlay;
                 self.supersample = 2;
-                self.max_colors = Colors::Max(10);
-                self.merge_distance = 0.048;
+                self.max_colors = Colors::Max(12);
+                self.merge_distance = 0.045;
                 self.min_area_px2 = 20.0;
-                self.tolerance_px = 0.55;
+                self.tolerance_px = 0.50;
                 self.corner_angle_deg = 45.0;
                 self.smooth_iters = 7;
                 self.denoise = DenoiseSettings {
-                    max_blotch_fraction: 0.012,
-                    blotch_oklab_threshold: 0.055,
+                    max_blotch_fraction: 0.018,
+                    blotch_oklab_threshold: 0.068,
                     sever_noise_bridges: 1,
                 };
             }
